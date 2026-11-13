@@ -89,9 +89,12 @@ body { background: var(--ink); color: var(--text); font-family: var(--ui); font-
 .pnlm-load-box { background: rgba(18, 16, 14, 0.85); }
 
 @media (max-width: 860px) {
-  .main { grid-template-columns: 1fr; grid-template-rows: minmax(340px, 62vh) auto; overflow-y: auto; }
+  .main { grid-template-columns: 1fr; grid-template-rows: auto auto; overflow-y: auto; }
+  .stage { display: grid; grid-template-rows: minmax(300px, 55vh) auto; background: var(--ink); }
+  #pano { position: relative; inset: auto; }
+  .overlay { position: static; padding-block: 12px 4px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  .where { max-width: none; flex: 1 1 100%; }
   .rail { border-left: 0; border-top: 1px solid var(--line); padding-left: max(16px, env(safe-area-inset-left, 0px)); }
-  .overlay { left: 10px; right: 10px; bottom: 10px; }
   .controls { justify-items: start; }
   .hint { display: none; }
   .where .room-name { font-size: 19px; }
