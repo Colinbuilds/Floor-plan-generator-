@@ -1,0 +1,5 @@
+camera_report.json
+*.blend
+*.blend1
+frames/
+__pycache__/
