@@ -1,340 +1,103 @@
 """
-Build a furnished Blender model of Residence 2B (The Residences, Levels 2-6)
-plus a 45-second eye-level walkthrough camera.
+Residence 2B (The Residences, Omaha - Levels 2-6): staged luxury Blender model,
+Omaha surroundings with four seasons + solar day cycle, and a 45 s walkthrough camera.
 
-Plan coordinates are in FEET measured on the PDF plan (x to the right, y down,
-origin at the plan's top-left), scaled from the labelled room dimensions
-(e.g. Balcony 30'-4", Bedroom 12'-10", Primary Bedroom 13'-0").
-World coordinates: X = x_ft * 0.3048, Y = -y_ft * 0.3048, Z up (metres).
+Plan coordinates are FEET measured on the PDF plan (x right, y down, origin top-left),
+calibrated on the labelled room sizes (Balcony 30'-4", Bedroom 12'-10", Primary Bedroom 13'-0").
+World: X = x_ft * 0.3048, Y = -y_ft * 0.3048, Z up (m).  Balcony faces south (+Y).
 
-Run:  python3 build_residence.py  [out.blend]
+Run:  python3 build_residence.py [out.blend] [--season fall]
+The saved file contains the walkthrough with an animated day cycle (morning -> golden hour on
+the balcony -> evening).  environment.apply_time()/set_season() re-light it for any season/time.
 """
-import bpy, bmesh, json, math, os, random, sys
+import bpy, json, math, os, random, sys
 from mathutils import Vector, Matrix
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = sys.argv[-1] if sys.argv[-1].endswith('.blend') else os.path.join(HERE, 'Residence_2B.blend')
-F = 0.3048
-CEIL = 2.74          # 9'-0" ceilings
-DOOR_H = 2.13        # 7'-0" doors
+sys.path.insert(0, HERE)
+import geo
+from geo import (F, CEIL, DOOR_H, coll, add_obst, OBST, W, link, mesh_obj, boxm, box, cylm, cyl, sphere, ico, torus,
+                 curtain, Group, principled, noisy, plank_floor, tile, marble, fluted, emissive, glass, art)
+import environment as env
+
+OUT = next((a for a in sys.argv if a.endswith('.blend')), os.path.join(HERE, 'Residence_2B.blend'))
+VIDEO_SEASON = sys.argv[sys.argv.index('--season') + 1] if '--season' in sys.argv else 'fall'
 FPS = 24
 DURATION = 45
 random.seed(7)
 
-# ----------------------------------------------------------------------------
-# scene reset
-# ----------------------------------------------------------------------------
 bpy.ops.wm.read_factory_settings(use_empty=True)
+geo.reset()
 scene = bpy.context.scene
 scene.unit_settings.system = 'METRIC'
 
-COLL = {}
-def coll(name):
-    if name not in COLL:
-        c = bpy.data.collections.new(name)
-        scene.collection.children.link(c)
-        COLL[name] = c
-    return COLL[name]
-
-OBST = []   # footprints for camera clearance checks: (cx, cy, hx, hy, rot) in ft
-def add_obst(cx, cy, hx, hy, rot=0.0, tag=''):
-    OBST.append((cx, cy, hx, hy, rot, tag))
-
 # ----------------------------------------------------------------------------
-# materials
+# materials - dark contemporary
 # ----------------------------------------------------------------------------
-MATS = {}
-def principled(name, color, rough=0.5, metal=0.0, **kw):
-    m = bpy.data.materials.new(name)
-    m.use_nodes = True
-    nt = m.node_tree
-    b = nt.nodes['Principled BSDF']
-    b.inputs['Base Color'].default_value = (*color, 1)
-    b.inputs['Roughness'].default_value = rough
-    b.inputs['Metallic'].default_value = metal
-    for k, v in kw.items():
-        b.inputs[k].default_value = v
-    m.diffuse_color = (*color, 1)
-    MATS[name] = m
-    return m
-
-def tex_coord(nt, scale=(1, 1, 1), space='Object'):
-    tc = nt.nodes.new('ShaderNodeTexCoord')
-    mp = nt.nodes.new('ShaderNodeMapping')
-    mp.inputs['Scale'].default_value = scale
-    nt.links.new(tc.outputs[space], mp.inputs['Vector'])
-    return mp.outputs['Vector']
-
-def oak_floor():
-    m = principled('Oak Floor', (0.55, 0.40, 0.26), 0.38)
-    nt = m.node_tree; b = nt.nodes['Principled BSDF']
-    v = tex_coord(nt)
-    br = nt.nodes.new('ShaderNodeTexBrick')
-    br.offset = 0.37; br.offset_frequency = 1
-    br.inputs['Scale'].default_value = 1.0
-    br.inputs['Brick Width'].default_value = 1.6
-    br.inputs['Row Height'].default_value = 0.19
-    br.inputs['Mortar Size'].default_value = 0.0015
-    br.inputs['Bias'].default_value = 0.0
-    br.inputs['Color1'].default_value = (0.60, 0.44, 0.29, 1)
-    br.inputs['Color2'].default_value = (0.50, 0.35, 0.22, 1)
-    br.inputs['Mortar'].default_value = (0.20, 0.13, 0.08, 1)
-    nt.links.new(v, br.inputs['Vector'])
-    # wood grain: noise stretched along the plank (x)
-    mp2 = nt.nodes.new('ShaderNodeMapping'); mp2.inputs['Scale'].default_value = (0.6, 25, 1)
-    nt.links.new(v, mp2.inputs['Vector'])
-    nz = nt.nodes.new('ShaderNodeTexNoise'); nz.inputs['Scale'].default_value = 3.0; nz.inputs['Detail'].default_value = 8
-    nt.links.new(mp2.outputs['Vector'], nz.inputs['Vector'])
-    mix = nt.nodes.new('ShaderNodeMix'); mix.data_type = 'RGBA'; mix.blend_type = 'MULTIPLY'
-    mix.inputs['Factor'].default_value = 0.35
-    nt.links.new(br.outputs['Color'], mix.inputs['A'])
-    nt.links.new(nz.outputs['Color'], mix.inputs['B'])
-    bc = nt.nodes.new('ShaderNodeBrightContrast'); bc.inputs['Bright'].default_value = 0.08
-    nt.links.new(mix.outputs['Result'], bc.inputs['Color'])
-    nt.links.new(bc.outputs['Color'], b.inputs['Base Color'])
-    return m
-
-def tile(name, c1, c2, size, rough=0.3, grout=(0.55, 0.55, 0.53)):
-    m = principled(name, c1, rough)
-    nt = m.node_tree; b = nt.nodes['Principled BSDF']
-    br = nt.nodes.new('ShaderNodeTexBrick')
-    br.offset = 0.5
-    br.inputs['Scale'].default_value = 1.0 / size
-    br.inputs['Brick Width'].default_value = 1.0
-    br.inputs['Row Height'].default_value = 0.5
-    br.inputs['Mortar Size'].default_value = 0.004
-    br.inputs['Color1'].default_value = (*c1, 1)
-    br.inputs['Color2'].default_value = (*c2, 1)
-    br.inputs['Mortar'].default_value = (*grout, 1)
-    nt.links.new(tex_coord(nt), br.inputs['Vector'])
-    nt.links.new(br.outputs['Color'], b.inputs['Base Color'])
-    return m
-
-def noisy(name, color, color2, scale=4.0, stretch=(1, 1, 1), rough=0.5, metal=0.0, bump=0.0):
-    m = principled(name, color, rough, metal)
-    nt = m.node_tree; b = nt.nodes['Principled BSDF']
-    nz = nt.nodes.new('ShaderNodeTexNoise'); nz.inputs['Scale'].default_value = scale; nz.inputs['Detail'].default_value = 6
-    nt.links.new(tex_coord(nt, stretch), nz.inputs['Vector'])
-    ramp = nt.nodes.new('ShaderNodeValToRGB')
-    ramp.color_ramp.elements[0].color = (*color, 1)
-    ramp.color_ramp.elements[1].color = (*color2, 1)
-    nt.links.new(nz.outputs['Fac'], ramp.inputs['Fac'])
-    nt.links.new(ramp.outputs['Color'], b.inputs['Base Color'])
-    if bump:
-        bp = nt.nodes.new('ShaderNodeBump'); bp.inputs['Strength'].default_value = bump
-        nt.links.new(nz.outputs['Fac'], bp.inputs['Height'])
-        nt.links.new(bp.outputs['Normal'], b.inputs['Normal'])
-    return m
-
-def emissive(name, color, strength):
-    m = principled(name, color, 0.5)
-    b = m.node_tree.nodes['Principled BSDF']
-    b.inputs['Emission Color'].default_value = (*color, 1)
-    b.inputs['Emission Strength'].default_value = strength
-    return m
-
-def glass(name, tint=(0.95, 0.97, 0.97)):
-    """thin architectural glass: transparent + fresnel reflection (no refraction),
-    so both EEVEE and Cycles show the real scene behind it."""
-    m = bpy.data.materials.new(name); m.use_nodes = True
-    nt = m.node_tree; nt.nodes.clear()
-    out = nt.nodes.new('ShaderNodeOutputMaterial')
-    tr = nt.nodes.new('ShaderNodeBsdfTransparent'); tr.inputs['Color'].default_value = (*tint, 1)
-    gl = nt.nodes.new('ShaderNodeBsdfGlossy'); gl.inputs['Roughness'].default_value = 0.02
-    lw = nt.nodes.new('ShaderNodeLayerWeight'); lw.inputs['Blend'].default_value = 0.12
-    mx = nt.nodes.new('ShaderNodeMixShader')
-    nt.links.new(lw.outputs['Fresnel'], mx.inputs['Fac'])
-    nt.links.new(tr.outputs['BSDF'], mx.inputs[1]); nt.links.new(gl.outputs['BSDF'], mx.inputs[2])
-    nt.links.new(mx.outputs['Shader'], out.inputs['Surface'])
-    MATS[name] = m
-    m.diffuse_color = (*tint, 0.25)
-    try:
-        m.surface_render_method = 'BLENDED'
-    except Exception:
-        pass
-    m.use_backface_culling = False
-    return m
-
-def art(name, c1, c2, c3, scale=1.5):
-    m = principled(name, c1, 0.8)
-    nt = m.node_tree; b = nt.nodes['Principled BSDF']
-    w = nt.nodes.new('ShaderNodeTexWave'); w.inputs['Scale'].default_value = scale
-    w.inputs['Distortion'].default_value = 6; w.inputs['Detail'].default_value = 2
-    nt.links.new(tex_coord(nt, space='Generated'), w.inputs['Vector'])
-    ramp = nt.nodes.new('ShaderNodeValToRGB'); cr = ramp.color_ramp
-    cr.elements[0].color = (*c1, 1); cr.elements[1].color = (*c3, 1)
-    e = cr.elements.new(0.5); e.color = (*c2, 1)
-    cr.interpolation = 'CONSTANT'
-    nt.links.new(w.outputs['Fac'], ramp.inputs['Fac'])
-    nt.links.new(ramp.outputs['Color'], b.inputs['Base Color'])
-    return m
-
-# palette: warm modern - light oak, warm white, deep navy (brand colour), copper/brass, cognac
 M = dict(
-    floor=oak_floor(),
-    wall=principled('Wall Paint Warm White', (0.80, 0.78, 0.74), 0.85),
-    ceiling=principled('Ceiling White', (0.85, 0.85, 0.84), 0.9),
-    trim=principled('Trim White', (0.86, 0.86, 0.84), 0.4),
-    tile=tile('Porcelain Tile 24x48', (0.70, 0.69, 0.66), (0.66, 0.65, 0.62), 0.61),
-    shower_tile=tile('Shower Tile', (0.82, 0.82, 0.80), (0.78, 0.78, 0.76), 0.2, 0.15),
-    balcony=tile('Balcony Pavers', (0.50, 0.48, 0.45), (0.46, 0.44, 0.41), 0.61, 0.7, (0.3, 0.3, 0.3)),
-    navy=principled('Cabinet Navy', (0.030, 0.045, 0.065), 0.45),
-    walnut=noisy('Walnut', (0.16, 0.08, 0.04), (0.28, 0.15, 0.08), 6, (1, 18, 1), 0.45),
-    oak=noisy('White Oak', (0.50, 0.37, 0.24), (0.62, 0.48, 0.33), 6, (1, 18, 1), 0.5),
-    quartz=noisy('White Quartz', (0.86, 0.86, 0.84), (0.72, 0.72, 0.71), 3, (1, 1, 1), 0.12),
-    steel=principled('Stainless', (0.75, 0.75, 0.74), 0.25, 1.0),
-    black=principled('Matte Black Metal', (0.02, 0.02, 0.02), 0.45, 0.6),
-    brass=principled('Brushed Brass', (0.80, 0.58, 0.32), 0.25, 1.0),
-    copper=principled('Copper', (0.75, 0.40, 0.25), 0.3, 1.0),
-    glass_black=principled('Black Glass', (0.01, 0.01, 0.01), 0.05),
-    boucle=noisy('Boucle Off-White', (0.70, 0.66, 0.60), (0.78, 0.75, 0.69), 120, (1, 1, 1), 1.0, bump=0.3),
-    linen=noisy('Linen White', (0.82, 0.80, 0.76), (0.76, 0.74, 0.70), 60, (1, 1, 1), 0.95, bump=0.1),
-    rust=principled('Terracotta Textile', (0.45, 0.16, 0.08), 0.9),
-    sage=principled('Sage Textile', (0.30, 0.35, 0.26), 0.9),
-    cognac=principled('Cognac Leather', (0.36, 0.14, 0.05), 0.45),
-    charcoal=principled('Charcoal Fabric', (0.07, 0.07, 0.075), 0.9),
-    rug=noisy('Wool Rug Oatmeal', (0.55, 0.50, 0.43), (0.62, 0.57, 0.50), 90, (1, 1, 1), 1.0, bump=0.4),
-    rug2=noisy('Wool Rug Rust', (0.32, 0.14, 0.08), (0.42, 0.22, 0.12), 60, (1, 1, 1), 1.0, bump=0.4),
-    stone=noisy('Fireplace Stone', (0.12, 0.12, 0.12), (0.22, 0.21, 0.20), 9, (1, 1, 1), 0.8, bump=0.5),
-    porcelain=principled('Porcelain White', (0.88, 0.88, 0.87), 0.08),
+    floor=plank_floor('Smoked Oak Wide Plank', (0.150, 0.105, 0.072), (0.120, 0.083, 0.058), (0.03, 0.02, 0.015)),
+    wall=noisy('Limewash Plaster Greige', (0.40, 0.37, 0.33), (0.45, 0.42, 0.38), 1.6, (1, 1, 1), 0.92, bump=0.05),
+    ceiling=principled('Ceiling Warm White', (0.62, 0.60, 0.56), 0.92),
+    trim=principled('Charcoal Trim', (0.045, 0.043, 0.042), 0.5),
+    tile=marble('Honed Marble Floor', (0.66, 0.65, 0.63), (0.18, 0.18, 0.19), 0.5, 0.35, 0.05),
+    marble=marble('Black-Veined Marble', (0.82, 0.81, 0.79), (0.16, 0.16, 0.17), 0.9, 0.10, 0.035),
+    nero=marble('Nero Marble', (0.020, 0.020, 0.022), (0.55, 0.54, 0.52), 0.7, 0.08, 0.04),
+    balcony=tile('Porcelain Pavers', (0.25, 0.24, 0.23), (0.22, 0.21, 0.20), 0.61, 0.7, (0.12, 0.12, 0.12)),
+    navy=noisy('Charcoal Oak Millwork', (0.032, 0.030, 0.029), (0.050, 0.046, 0.043), 5, (1, 1, 22), 0.45),
+    fluted=fluted('Fluted Smoked Oak', (0.10, 0.07, 0.05), (0.14, 0.10, 0.07), 45),
+    walnut=noisy('Smoked Oak', (0.09, 0.062, 0.042), (0.15, 0.105, 0.07), 6, (1, 18, 1), 0.4),
+    oak=noisy('Smoked Oak Light', (0.16, 0.115, 0.08), (0.22, 0.16, 0.11), 6, (1, 18, 1), 0.45),
+    steel=principled('Brushed Steel', (0.6, 0.6, 0.6), 0.3, 1.0),
+    black=principled('Matte Black Metal', (0.018, 0.018, 0.018), 0.45, 0.7),
+    bronze=principled('Satin Bronze', (0.30, 0.19, 0.11), 0.30, 1.0),
+    glass_black=principled('Black Glass', (0.008, 0.008, 0.009), 0.04),
+    boucle=noisy('Cream Boucle', (0.62, 0.57, 0.50), (0.70, 0.66, 0.59), 140, (1, 1, 1), 1.0, bump=0.35),
+    linen=noisy('Ivory Linen', (0.74, 0.71, 0.66), (0.68, 0.65, 0.60), 70, (1, 1, 1), 0.95, bump=0.1),
+    mushroom=noisy('Mushroom Velvet', (0.26, 0.22, 0.19), (0.32, 0.28, 0.24), 90, (1, 1, 1), 0.7, bump=0.15),
+    charcoal=noisy('Charcoal Wool', (0.045, 0.045, 0.048), (0.07, 0.07, 0.072), 80, (1, 1, 1), 0.95, bump=0.2),
+    rust=principled('Rust Velvet', (0.30, 0.085, 0.035), 0.6),
+    olive=principled('Olive Velvet', (0.12, 0.13, 0.06), 0.6),
+    cognac=noisy('Cognac Leather', (0.20, 0.075, 0.03), (0.26, 0.10, 0.04), 30, (1, 1, 1), 0.38, bump=0.1),
+    black_leather=principled('Black Leather', (0.02, 0.018, 0.017), 0.35),
+    rug=noisy('Charcoal Wool Rug', (0.07, 0.065, 0.06), (0.12, 0.11, 0.10), 40, (1, 1, 1), 1.0, bump=0.4),
+    rug2=art('Ivory Abstract Rug', [(0.55, 0.51, 0.45), (0.30, 0.27, 0.24), (0.08, 0.07, 0.07)], 0.9, 4),
+    porcelain=principled('Stone Resin White', (0.80, 0.79, 0.77), 0.15),
     mirror=principled('Mirror', (0.9, 0.9, 0.9), 0.02, 1.0),
     glass=glass('Clear Glass'),
-    shower_glass=glass('Shower Glass', (0.92, 0.96, 0.96)),
-    frame=principled('Window Frame Black', (0.025, 0.025, 0.028), 0.5, 0.3),
-    plant=noisy('Leaf Green', (0.05, 0.14, 0.04), (0.10, 0.22, 0.07), 8, (1, 1, 1), 0.6),
-    pot=principled('Terracotta Pot', (0.48, 0.22, 0.12), 0.85),
-    soil=principled('Soil', (0.05, 0.035, 0.02), 1.0),
-    log=noisy('Firewood', (0.13, 0.07, 0.035), (0.30, 0.19, 0.10), 14, (1, 1, 1), 0.9, bump=0.4),
-    flame=emissive('Fire', (1.0, 0.38, 0.08), 6.0),
-    lampshade=emissive('Lamp Shade Glow', (1.0, 0.86, 0.68), 4.0),
-    bulb=emissive('Warm Bulb', (1.0, 0.80, 0.55), 30.0),
-    screen=principled('TV Screen', (0.005, 0.005, 0.006), 0.08),
-    ground=noisy('Ground Grass', (0.09, 0.14, 0.05), (0.14, 0.18, 0.08), 0.05, (1, 1, 1), 1.0),
-    road=principled('Asphalt', (0.06, 0.06, 0.06), 0.9),
-    facade=noisy('Neighbour Facade', (0.45, 0.42, 0.38), (0.55, 0.52, 0.47), 0.4, (1, 1, 1), 0.9),
-    facade2=noisy('Neighbour Brick', (0.36, 0.18, 0.11), (0.45, 0.25, 0.15), 0.4, (1, 1, 1), 0.9),
-    concrete=principled('Concrete Soffit', (0.55, 0.54, 0.52), 0.9),
-    art1=art('Art Abstract Copper', (0.80, 0.74, 0.64), (0.62, 0.30, 0.14), (0.10, 0.13, 0.17)),
-    art2=art('Art Abstract Sage', (0.86, 0.83, 0.76), (0.40, 0.46, 0.36), (0.75, 0.55, 0.35), 0.8),
-    art3=art('Art Abstract Navy', (0.88, 0.86, 0.80), (0.08, 0.12, 0.18), (0.70, 0.45, 0.30), 2.5),
+    shower_glass=glass('Shower Glass', (0.90, 0.92, 0.92)),
+    frame=principled('Window Frame Black', (0.018, 0.018, 0.02), 0.45, 0.3),
+    plant=noisy('Leaf Green', (0.04, 0.10, 0.03), (0.09, 0.17, 0.05), 8, (1, 1, 1), 0.6),
+    olive_leaf=noisy('Olive Leaf', (0.16, 0.19, 0.12), (0.26, 0.29, 0.20), 12, (1, 1, 1), 0.7),
+    pot=noisy('Stone Planter', (0.20, 0.19, 0.17), (0.28, 0.27, 0.25), 10, (1, 1, 1), 0.85, bump=0.3),
+    ceramic=principled('Matte Ceramic Black', (0.03, 0.03, 0.03), 0.6),
+    ceramic2=principled('Matte Ceramic Sand', (0.50, 0.44, 0.36), 0.7),
+    soil=principled('Soil', (0.04, 0.03, 0.02), 1.0),
+    log=noisy('Firewood', (0.10, 0.06, 0.03), (0.26, 0.17, 0.09), 14, (1, 1, 1), 0.9, bump=0.4),
+    flame=geo.flame_material('Fire', (1.0, 0.40, 0.08), 5.0),
+    lampshade=emissive('Lamp Shade Glow', (1.0, 0.82, 0.62), 3.0, base=(0.8, 0.75, 0.68)),
+    led=emissive('LED Strip 2700K', (1.0, 0.78, 0.52), 3.0),
+    bulb=emissive('Warm Bulb', (1.0, 0.78, 0.52), 25.0),
+    alabaster=emissive('Alabaster Glow', (1.0, 0.86, 0.70), 4.0, base=(0.85, 0.80, 0.72)),
+    screen=principled('TV Screen', (0.004, 0.004, 0.005), 0.06),
+    concrete=principled('Architectural Concrete', (0.30, 0.29, 0.28), 0.9),
+    sheer=principled('Sheer Linen', (0.70, 0.67, 0.61), 0.95),
+    towel=noisy('Towel Ivory', (0.72, 0.69, 0.64), (0.78, 0.75, 0.70), 200, (1, 1, 1), 1.0, bump=0.3),
+    teak=noisy('Teak', (0.22, 0.12, 0.06), (0.30, 0.17, 0.09), 6, (1, 18, 1), 0.6),
+    outdoor=noisy('Outdoor Cushion Sand', (0.42, 0.38, 0.32), (0.48, 0.44, 0.37), 90, (1, 1, 1), 1.0),
+    fire_glass=principled('Fire Glass', (0.04, 0.05, 0.06), 0.05),
+    planting=noisy('Season Planting', (0.45, 0.30, 0.10), (0.6, 0.4, 0.13), 25, (1, 1, 1), 0.8),
+    art1=art('Art Charcoal Gesture', [(0.78, 0.75, 0.70), (0.06, 0.06, 0.06), (0.55, 0.45, 0.35)], 1.2, 8),
+    art2=art('Art Rust Field', [(0.30, 0.10, 0.05), (0.55, 0.30, 0.16), (0.12, 0.10, 0.09), (0.70, 0.62, 0.52)], 0.7, 3),
+    art3=art('Art Ink Wash', [(0.80, 0.78, 0.74), (0.35, 0.36, 0.38), (0.05, 0.05, 0.06)], 2.0, 12),
+    art4=art('Art Gold Leaf', [(0.04, 0.04, 0.045), (0.45, 0.32, 0.12), (0.06, 0.06, 0.06)], 3.0, kind='VORONOI'),
 )
+# the sheer curtains: let light through
+_sh = M['sheer'].node_tree; _b = _sh.nodes['Principled BSDF']
+_b.inputs['Transmission Weight'].default_value = 0.55; _b.inputs['Alpha'].default_value = 0.8
+M['fire_table'] = geo.flame_material('Fire Table Flame', (1.0, 0.42, 0.10), 5.0)
 BOOK_MATS = [principled(f'Book {i}', c, 0.8) for i, c in enumerate(
-    [(0.5, 0.15, 0.08), (0.1, 0.15, 0.25), (0.7, 0.65, 0.55), (0.2, 0.3, 0.2), (0.6, 0.45, 0.2), (0.1, 0.1, 0.1)])]
-
-# ----------------------------------------------------------------------------
-# geometry helpers
-# ----------------------------------------------------------------------------
-def W(x, y):
-    """plan feet -> world metres (XY)."""
-    return x * F, -y * F
-
-def link(obj, cname):
-    coll(cname).objects.link(obj)
-    return obj
-
-def mesh_obj(name, verts, faces, mat, cname, bevel=0.0, smooth=False):
-    me = bpy.data.meshes.new(name)
-    me.from_pydata(verts, [], faces)
-    me.update()
-    if smooth:
-        for p in me.polygons:
-            p.use_smooth = True
-    ob = bpy.data.objects.new(name, me)
-    if mat is not None:
-        me.materials.append(mat)
-    link(ob, cname)
-    if bevel > 0:
-        md = ob.modifiers.new('Bevel', 'BEVEL')
-        md.width = bevel; md.segments = 2; md.limit_method = 'ANGLE'
-    return ob
-
-def cube_data(x0, y0, z0, x1, y1, z1):
-    v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
-         (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
-    f = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
-    return v, f
-
-def boxm(x0, y0, z0, x1, y1, z1, mat, cname, name='Box', bevel=0.0):
-    """box in world metres"""
-    x0, x1 = sorted((x0, x1)); y0, y1 = sorted((y0, y1)); z0, z1 = sorted((z0, z1))
-    v, f = cube_data(x0, y0, z0, x1, y1, z1)
-    return mesh_obj(name, v, f, mat, cname, bevel)
-
-def box(x0, y0, x1, y1, z0, z1, mat, cname, name='Box', bevel=0.0, obst=False, tag=''):
-    """box in plan feet (xy) and metres (z)"""
-    X0, Y0 = W(x0, y0); X1, Y1 = W(x1, y1)
-    if obst:
-        add_obst((x0 + x1) / 2, (y0 + y1) / 2, abs(x1 - x0) / 2, abs(y1 - y0) / 2, 0, tag or name)
-    return boxm(X0, Y0, z0, X1, Y1, z1, mat, cname, name, bevel)
-
-def cyl_data(r, z0, z1, n=24, rx=None, ry=None, cap=True):
-    rx = rx or r; ry = ry or r
-    v = []
-    for z in (z0, z1):
-        for i in range(n):
-            a = 2 * math.pi * i / n
-            v.append((rx * math.cos(a), ry * math.sin(a), z))
-    f = [(i, (i + 1) % n, n + (i + 1) % n, n + i) for i in range(n)]
-    if cap:
-        f.append(tuple(reversed(range(n))))
-        f.append(tuple(range(n, 2 * n)))
-    return v, f
-
-def cylm(cx, cy, r, z0, z1, mat, cname, name='Cyl', n=24, rx=None, ry=None, smooth=True, cap=True):
-    v, f = cyl_data(r, z0, z1, n, rx, ry, cap)
-    v = [(cx + a, cy + b, c) for a, b, c in v]
-    ob = mesh_obj(name, v, f, mat, cname, smooth=smooth)
-    return ob
-
-def cyl(x, y, r, z0, z1, mat, cname, name='Cyl', n=24, obst=False, tag='', **kw):
-    X, Y = W(x, y)
-    if obst:
-        add_obst(x, y, r / F, r / F, 0, tag or name)
-    return cylm(X, Y, r, z0, z1, mat, cname, name, n, **kw)
-
-def sphere(cx, cy, cz, r, mat, cname, name='Sphere', sx=1, sy=1, sz=1, seg=16):
-    me = bpy.data.meshes.new(name)
-    bm = bmesh.new()
-    bmesh.ops.create_uvsphere(bm, u_segments=seg, v_segments=seg // 2, radius=r)
-    bmesh.ops.scale(bm, vec=(sx, sy, sz), verts=bm.verts)
-    bm.to_mesh(me); bm.free()
-    for p in me.polygons:
-        p.use_smooth = True
-    ob = bpy.data.objects.new(name, me)
-    me.materials.append(mat)
-    ob.location = (cx, cy, cz)
-    link(ob, cname)
-    return ob
-
-class Group:
-    """Furniture built in local metres (+Y = front) placed at plan (x, y) ft, facing a world direction."""
-    def __init__(self, name, x, y, facing, cname, hx=None, hy=None, obst=True):
-        self.cname = cname
-        self.empty = bpy.data.objects.new(name, None)
-        self.empty.empty_display_size = 0.3
-        X, Y = W(x, y)
-        self.empty.location = (X, Y, 0)
-        # facing: 'N','S','E','W' or degrees (world yaw of +Y; N=0, W=90, S=180, E=-90)
-        ang = {'N': 0, 'W': 90, 'S': 180, 'E': -90}.get(facing, facing)
-        self.rot = math.radians(ang)
-        self.empty.rotation_euler = (0, 0, self.rot)
-        link(self.empty, cname)
-        self.name = name
-        if obst and hx is not None:
-            add_obst(x, y, hx / F, hy / F, self.rot, name)
-
-    def _par(self, ob):
-        ob.parent = self.empty
-        return ob
-
-    def box(self, x0, y0, z0, x1, y1, z1, mat, bevel=0.01, name=None):
-        return self._par(boxm(x0, y0, z0, x1, y1, z1, mat, self.cname, name or self.name, bevel))
-
-    def cyl(self, x, y, r, z0, z1, mat, n=20, name=None, **kw):
-        return self._par(cylm(x, y, r, z0, z1, mat, self.cname, name or self.name, n, **kw))
-
-    def sphere(self, x, y, z, r, mat, **kw):
-        return self._par(sphere(x, y, z, r, mat, self.cname, self.name, **kw))
+    [(0.30, 0.08, 0.04), (0.05, 0.06, 0.08), (0.62, 0.58, 0.50), (0.12, 0.13, 0.08), (0.40, 0.30, 0.15),
+     (0.02, 0.02, 0.02), (0.55, 0.52, 0.48)])]
 
 # ----------------------------------------------------------------------------
 # architecture: walls traced from the PDF plan
@@ -410,7 +173,7 @@ for (o, a, b, c0, c1, hinge, swing, ang, nm) in DOORS:
     piv.location = (X, Y, 0); piv.rotation_euler = (0, 0, yaw)
     link(piv, AR)
     leaf = boxm(0.005, -thick / 2, 0.005, width, thick / 2, DOOR_H - 0.01,
-                M['trim'] if 'Front' not in nm else M['navy'], AR, nm + ' Leaf', 0.004)
+                M['walnut'] if 'Front' not in nm else M['navy'], AR, nm + ' Leaf', 0.004)
     leaf.parent = piv
     # handle
     hd = boxm(width - 0.20, -thick / 2 - 0.06, 0.99, width - 0.07, thick / 2 + 0.06, 1.01, M['black'], AR, nm + ' Handle')
@@ -480,442 +243,663 @@ box(14.0, -1.4, 46.9, 0.6, -0.40, -0.035, M['concrete'], AR, 'Slab Edge')
 box(14.0, -1.4, 46.9, 0.6, CEIL, CEIL + 0.30, M['concrete'], AR, 'Soffit')
 
 # ----------------------------------------------------------------------------
-# furniture helpers
+# lights (every light stores a base energy + group so the day cycle can scale it)
+# ----------------------------------------------------------------------------
+LI = 'Lighting'
+WARM = (1.0, 0.78, 0.55)
+
+def _light(kind, name, loc, power, color, group, **kw):
+    d = bpy.data.lights.new(name, kind)
+    d.energy = power; d.color = color
+    d['base'] = power; d['group'] = group
+    for k, v in kw.items():
+        setattr(d, k, v)
+    o = bpy.data.objects.new(name, d); o.location = loc
+    link(o, LI)
+    return o
+
+def add_point(name, X, Y, Z, power, color=WARM, radius=0.08, group='accent'):
+    return _light('POINT', name, (X, Y, Z), power, color, group, shadow_soft_size=radius)
+
+def area(name, x0, y0, x1, y1, power, color=(1.0, 0.84, 0.66), z=CEIL - 0.02, group='interior'):
+    X, Y = W((x0 + x1) / 2, (y0 + y1) / 2)
+    o = _light('AREA', name, (X, Y, z), power, color, group, shape='RECTANGLE',
+               size=abs(x1 - x0) * F * 0.8, size_y=abs(y1 - y0) * F * 0.8)
+    return o
+
+def downlight(x, y, power=28, cn=LI):
+    """recessed 2700K spot - pools of light rather than flat fill"""
+    X, Y = W(x, y)
+    cylm(X, Y, 0.045, CEIL - 0.004, CEIL - 0.001, M['bulb'], cn, 'Recessed Downlight', 16)
+    cylm(X, Y, 0.06, CEIL - 0.003, CEIL, M['black'], cn, 'Downlight Trim', 16)
+    _light('SPOT', 'Downlight', (X, Y, CEIL - 0.03), power, WARM, 'interior',
+           spot_size=math.radians(80), spot_blend=0.7, shadow_soft_size=0.04)
+
+def picture_light(x, y, facing, width, z):
+    """small area light above artwork aimed at the wall"""
+    X, Y = W(x, y)
+    ang = {'E': -90, 'W': 90, 'N': 0, 'S': 180}[facing]
+    a = math.radians(ang)
+    fx, fy = -math.sin(a), math.cos(a)                      # direction the art faces
+    o = _light('AREA', 'Picture Light', (X + fx * 0.25, Y + fy * 0.25, z), 18, WARM, 'accent',
+               shape='RECTANGLE', size=width, size_y=0.08)
+    o.rotation_euler = (Vector((-fx, -fy, -1.4))).to_track_quat('-Z', 'Y').to_euler()
+
+# ----------------------------------------------------------------------------
+# furniture library
 # ----------------------------------------------------------------------------
 FU = 'Furniture'
 
-def chair(x, y, facing, mat_seat=None, name='Dining Chair', cn=FU):
-    g = Group(name, x, y, facing, cn, 0.25, 0.27)
-    ms = mat_seat or M['walnut']
-    for sx in (-0.2, 0.2):
-        for sy in (-0.2, 0.2):
-            g.cyl(sx, sy, 0.015, 0, 0.45, M['black'], 8)
-    g.box(-0.24, -0.24, 0.43, 0.24, 0.24, 0.48, ms, 0.015)
-    g.box(-0.23, -0.27, 0.48, 0.23, -0.23, 0.86, ms, 0.015)
+def chair(x, y, facing, mat_seat=None, name='Dining Chair', cn=FU, frame=None):
+    g = Group(name, x, y, facing, cn, 0.26, 0.28)
+    ms = mat_seat or M['mushroom']; fm = frame or M['walnut']
+    for sx in (-0.21, 0.21):
+        for sy in (-0.21, 0.21):
+            g.box(sx - 0.018, sy - 0.018, 0, sx + 0.018, sy + 0.018, 0.44, fm, 0.004)
+    g.box(-0.25, -0.25, 0.42, 0.25, 0.25, 0.50, ms, 0.03)
+    g.box(-0.25, -0.28, 0.48, 0.25, -0.20, 0.90, ms, 0.035)
+    g.box(-0.27, -0.26, 0.48, -0.22, 0.10, 0.70, ms, 0.02)
+    g.box(0.22, -0.26, 0.48, 0.27, 0.10, 0.70, ms, 0.02)
     return g
 
-def armchair(x, y, facing, mat=None, name='Lounge Chair', cn=FU):
+def lounge_chair(x, y, facing, mat=None, name='Lounge Chair', cn=FU, base=None):
+    """sculptural barrel-back lounge chair"""
     m = mat or M['cognac']
-    g = Group(name, x, y, facing, cn, 0.42, 0.44)
-    g.box(-0.40, -0.42, 0.08, 0.40, 0.42, 0.40, m, 0.04)
-    g.box(-0.40, -0.42, 0.40, 0.40, -0.24, 0.82, m, 0.05)
-    g.box(-0.40, -0.40, 0.40, -0.29, 0.40, 0.62, m, 0.04)
-    g.box(0.29, -0.40, 0.40, 0.40, 0.40, 0.62, m, 0.04)
-    g.box(-0.29, -0.24, 0.40, 0.29, 0.40, 0.50, m, 0.05)
-    for sx in (-0.34, 0.34):
-        for sy in (-0.36, 0.36):
-            g.cyl(sx, sy, 0.02, 0, 0.09, M['walnut'], 8)
+    g = Group(name, x, y, facing, cn, 0.44, 0.44)
+    g.cyl(0, 0, 0.26, 0.0, 0.06, base or M['bronze'], 28)
+    g.cyl(0, 0, 0.05, 0.06, 0.20, base or M['bronze'], 12)
+    g.cyl(0, 0.02, 0.40, 0.20, 0.44, m, 36, ry=0.38)
+    g.cyl(0, 0.04, 0.36, 0.44, 0.52, m, 36, ry=0.33)
+    back = g.cyl(0, -0.02, 0.43, 0.20, 0.78, m, 40, ry=0.41, cap=False)
+    # carve the front of the barrel back away by squashing a cylinder shell
+    back.scale = (1, 1, 1)
+    md = back.modifiers.new('Shell', 'SOLIDIFY'); md.thickness = 0.09
+    # remove front half faces
+    me = back.data
+    import bmesh as _bm
+    bm = _bm.new(); bm.from_mesh(me)
+    kill = [f for f in bm.faces if f.calc_center_median().y > 0.06 + 0 * f.index]
+    _bm.ops.delete(bm, geom=kill, context='FACES'); bm.to_mesh(me); bm.free()
+    g.box(-0.18, -0.28, 0.50, 0.18, -0.16, 0.74, M['linen'], 0.06)
     return g
 
-def lamp(x, y, z_base, cn=FU, h=0.45, r=0.17, name='Table Lamp', light=True):
-    X, Y = W(x, y)
-    cylm(X, Y, 0.07, z_base, z_base + 0.03, M['brass'], cn, name)
-    cylm(X, Y, 0.012, z_base, z_base + h, M['brass'], cn, name, 8)
-    cylm(X, Y, r, z_base + h - 0.05, z_base + h + 0.22, M['lampshade'], cn, name + ' Shade', 28, cap=False)
-    if light:
-        add_point(name + ' Light', X, Y, z_base + h + 0.05, 25, (1.0, 0.78, 0.55), 0.12)
+def armchair(x, y, facing, mat=None, name='Armchair', cn=FU):
+    m = mat or M['boucle']
+    g = Group(name, x, y, facing, cn, 0.42, 0.44)
+    g.box(-0.40, -0.42, 0.06, 0.40, 0.42, 0.40, m, 0.06)
+    g.box(-0.40, -0.42, 0.40, 0.40, -0.22, 0.78, m, 0.07)
+    g.box(-0.40, -0.40, 0.40, -0.26, 0.40, 0.60, m, 0.06)
+    g.box(0.26, -0.40, 0.40, 0.40, 0.40, 0.60, m, 0.06)
+    g.box(-0.26, -0.22, 0.40, 0.26, 0.40, 0.50, m, 0.06)
+    g.box(-0.36, -0.38, 0.0, 0.36, 0.38, 0.06, M['black'], 0.005)
+    return g
 
-def floor_lamp(x, y, cn=FU, name='Floor Lamp'):
-    lamp(x, y, 0, cn, h=1.45, r=0.22, name=name)
-    add_obst(x, y, 0.8, 0.8, 0, name)
-
-def plant(x, y, cn=FU, h=1.4, r=0.22, name='Plant'):
+def lamp(x, y, z_base, cn=FU, h=0.45, r=0.17, name='Table Lamp', power=18, base_mat=None):
     X, Y = W(x, y)
-    cylm(X, Y, r, 0, 0.42, M['pot'], cn, name + ' Pot', 24)
-    cylm(X, Y, r - 0.02, 0.38, 0.41, M['soil'], cn, name + ' Soil', 24)
-    cylm(X, Y, 0.018, 0.4, h * 0.8, M['walnut'], cn, name + ' Stem', 8)
-    for i in range(14):
-        a = random.uniform(0, 2 * math.pi); rr = random.uniform(0.05, r * 1.7)
-        z = random.uniform(0.6, h)
-        s = sphere(X + rr * math.cos(a), Y + rr * math.sin(a), z, random.uniform(0.09, 0.15), M['plant'], cn, name + ' Leaf',
-                   sx=1.0, sy=0.45, sz=1.4, seg=10)
-        s.rotation_euler = (random.uniform(-0.6, 0.6), random.uniform(-0.6, 0.6), a)
-    add_obst(x, y, (r * 1.7) / F, (r * 1.7) / F, 0, name)
+    cylm(X, Y, 0.09, z_base, z_base + 0.22, base_mat or M['ceramic'], cn, name + ' Base', 24, r_top=0.05)
+    cylm(X, Y, 0.012, z_base + 0.2, z_base + h, M['bronze'], cn, name, 8)
+    cylm(X, Y, r, z_base + h - 0.05, z_base + h + 0.20, M['lampshade'], cn, name + ' Shade', 28, cap=False, r_top=r * 0.8)
+    add_point(name + ' Light', X, Y, z_base + h + 0.04, power, radius=0.1)
+
+def arc_lamp(x, y, tx, ty, cn=FU, name='Arc Floor Lamp'):
+    """bronze arc lamp from (x,y) reaching toward (tx,ty) (plan ft)"""
+    X, Y = W(x, y); TX, TY = W(tx, ty)
+    cylm(X, Y, 0.18, 0, 0.05, M['nero'], cn, name + ' Base', 28)
+    pts = []
+    for i in range(13):
+        t = i / 12
+        px = X + (TX - X) * (1 - math.cos(t * math.pi / 2))
+        py = Y + (TY - Y) * (1 - math.cos(t * math.pi / 2))
+        pz = 0.05 + 2.05 * math.sin(t * math.pi * 0.62) / math.sin(math.pi * 0.62) if t < 0.81 else None
+        pts.append((px, py, pz))
+    zs = [0.05 + 2.1 * math.sin(min(1, i / 9) * math.pi / 2) - (0.25 * max(0, i - 9) / 3) for i in range(13)]
+    prev = None
+    for (px, py, _), pz in zip(pts, zs):
+        if prev:
+            mid = ((prev[0] + px) / 2, (prev[1] + py) / 2, (prev[2] + pz) / 2)
+            d = Vector((px - prev[0], py - prev[1], pz - prev[2]))
+            o = cylm(0, 0, 0.012, -d.length / 2, d.length / 2, M['bronze'], cn, name + ' Arc', 8)
+            o.location = mid; o.rotation_euler = d.to_track_quat('Z', 'Y').to_euler()
+        prev = (px, py, pz)
+    sphere(TX, TY, zs[-1] - 0.12, 0.2, M['bronze'], cn, name + ' Shade', sz=0.55, seg=20)
+    cylm(TX, TY, 0.15, zs[-1] - 0.20, zs[-1] - 0.19, M['bulb'], cn, name + ' Glow', 20)
+    add_point(name + ' Light', TX, TY, zs[-1] - 0.3, 30, radius=0.1)
+    add_obst(x, y, 0.65, 0.65, 0, name)
+
+def plant(x, y, cn=FU, h=1.4, r=0.22, name='Plant', leaf=None):
+    X, Y = W(x, y)
+    cylm(X, Y, r, 0, 0.5, M['pot'], cn, name + ' Planter', 28, r_top=r * 1.08)
+    cylm(X, Y, r * 1.02, 0.46, 0.48, M['soil'], cn, name + ' Soil', 24)
+    cylm(X, Y, 0.02, 0.45, h * 0.7, M['walnut'], cn, name + ' Stem', 8)
+    lm = leaf or M['plant']
+    me = ico(0.11, 1, lm, name + ' Leaf mesh', noise=0.2)
+    for i in range(22):
+        a = random.uniform(0, 2 * math.pi); rr = random.uniform(0.05, r * 1.8)
+        z = random.uniform(0.75, h)
+        o = bpy.data.objects.new(name + ' Leaf', me)
+        o.location = (X + rr * math.cos(a), Y + rr * math.sin(a), z)
+        o.scale = (1.1, 0.35, 1.5); o.rotation_euler = (random.uniform(-0.7, 0.7), random.uniform(-0.7, 0.7), a)
+        link(o, cn)
+    add_obst(x, y, (r * 1.8) / F, (r * 1.8) / F, 0, name)
+
+def olive_tree(x, y, cn=FU, h=2.1, name='Olive Tree'):
+    X, Y = W(x, y)
+    cylm(X, Y, 0.30, 0, 0.55, M['pot'], cn, name + ' Planter', 32, r_top=0.33)
+    cylm(X, Y, 0.31, 0.52, 0.54, M['soil'], cn, name + ' Soil', 24)
+    for k in range(3):
+        a = k * 2.1
+        d = Vector((math.cos(a) * 0.25, math.sin(a) * 0.25, h * 0.55))
+        o = cylm(0, 0, 0.035, 0, d.length, M['walnut'], cn, name + ' Trunk', 8, r_top=0.018)
+        o.location = (X, Y, 0.5); o.rotation_euler = d.to_track_quat('Z', 'Y').to_euler()
+    me = ico(0.09, 1, M['olive_leaf'], name + ' Leaf', noise=0.3)
+    for i in range(60):
+        a = random.uniform(0, 2 * math.pi); rr = random.uniform(0.0, 0.62)
+        o = bpy.data.objects.new(name + ' Leaves', me)
+        o.location = (X + rr * math.cos(a), Y + rr * math.sin(a), random.uniform(h * 0.62, h))
+        o.scale = (1.4, 0.5, 0.6); o.rotation_euler = (0, random.uniform(-0.5, 0.5), a)
+        link(o, cn)
+    add_obst(x, y, 2.2, 2.2, 0, name)
 
 def rug(x0, y0, x1, y1, mat, cn=FU, name='Rug'):
-    box(x0, y0, x1, y1, 0.0, 0.012, mat, cn, name, 0.004)
+    box(x0, y0, x1, y1, 0.0, 0.014, mat, cn, name, 0.006)
 
-def frame_art(x, y, facing, w, h, zc, mat, cn=FU, name='Art'):
+def frame_art(x, y, facing, w, h, zc, mat, cn=FU, name='Art', light=True):
     g = Group(name, x, y, facing, cn, obst=False)
-    g.box(-w / 2, -0.015, zc - h / 2, w / 2, 0.015, zc + h / 2, M['walnut'], 0.003)
-    g.box(-w / 2 + 0.04, 0.012, zc - h / 2 + 0.04, w / 2 - 0.04, 0.02, zc + h / 2 - 0.04, mat, 0)
+    g.box(-w / 2, -0.02, zc - h / 2, w / 2, 0.025, zc + h / 2, M['black'], 0.003)
+    g.box(-w / 2 + 0.02, 0.025, zc - h / 2 + 0.02, w / 2 - 0.02, 0.03, zc + h / 2 - 0.02, M['linen'], 0)
+    g.box(-w / 2 + 0.07, 0.03, zc - h / 2 + 0.07, w / 2 - 0.07, 0.034, zc + h / 2 - 0.07, mat, 0)
+    if light:
+        picture_light(x, y, facing, w * 0.7, zc + h / 2 + 0.15)
 
-def bed(x, y, facing, w, l, cn=FU, name='Bed', throw=None):
-    g = Group(name, x, y, facing, cn, w / 2 + 0.05, l / 2 + 0.05)
-    g.box(-w / 2, -l / 2, 0.08, w / 2, l / 2, 0.35, M['oak'], 0.02)               # frame
-    g.box(-w / 2 - 0.05, -l / 2 - 0.06, 0.0, w / 2 + 0.05, -l / 2 + 0.04, 1.25, M['charcoal'], 0.04)  # headboard
-    g.box(-w / 2 + 0.03, -l / 2 + 0.06, 0.35, w / 2 - 0.03, l / 2 - 0.03, 0.60, M['linen'], 0.06)   # mattress
-    g.box(-w / 2 - 0.02, -l / 2 + 0.6, 0.45, w / 2 + 0.02, l / 2 + 0.01, 0.64, M['linen'], 0.07)    # duvet
-    g.box(-w / 2 - 0.03, l / 2 - 0.62, 0.46, w / 2 + 0.03, l / 2 - 0.12, 0.66, throw or M['rust'], 0.05)  # throw
-    n = 2 if w < 1.7 else 2
-    pw = (w - 0.12) / n
+def books(x0, y, z, n, cn, axis='x', name='Books'):
+    """row of books starting at plan (x0, y) ft"""
+    pos = x0
     for i in range(n):
-        x0 = -w / 2 + 0.06 + i * pw
-        g.box(x0 + 0.02, -l / 2 + 0.08, 0.60, x0 + pw - 0.02, -l / 2 + 0.28, 0.86, M['linen'], 0.08)
-        g.box(x0 + 0.12, -l / 2 + 0.30, 0.58, x0 + pw - 0.12, -l / 2 + 0.44, 0.78, M['sage'], 0.06)
+        wft = random.uniform(0.09, 0.14); h = random.uniform(0.21, 0.29)
+        if axis == 'x':
+            box(pos, y - 0.5, pos + wft, y, z, z + h, random.choice(BOOK_MATS), cn, name)
+        else:
+            box(y - 0.5, pos, y, pos + wft, z, z + h, random.choice(BOOK_MATS), cn, name)
+        pos += wft + 0.005
+    return pos
+
+def vessel(x, y, z, r, h, mat, cn, name='Vessel'):
+    X, Y = W(x, y)
+    o = cylm(X, Y, r, z, z + h, mat, cn, name, 28, r_top=r * 0.55)
+    o.modifiers.new('Sub', 'SUBSURF').levels = 1
+    return o
+
+def stack(x, y, z, cn, n=3, name='Coffee Table Books'):
+    for i in range(n):
+        w, d = random.uniform(0.9, 1.1), random.uniform(0.7, 0.85)
+        box(x - w / 2, y - d / 2, x + w / 2, y + d / 2, z + i * 0.035, z + (i + 1) * 0.035 - 0.003,
+            random.choice(BOOK_MATS), cn, name, 0.002)
+    return z + n * 0.035
+
+def bed(x, y, facing, w, l, cn=FU, name='Bed', throw=None, panel=None):
+    g = Group(name, x, y, facing, cn, w / 2 + 0.05, l / 2 + 0.05)
+    g.box(-w / 2 - 0.03, -l / 2, 0.06, w / 2 + 0.03, l / 2 + 0.03, 0.34, panel or M['mushroom'], 0.03)    # upholstered base
+    g.box(-w / 2 + 0.03, -l / 2 + 0.05, 0.34, w / 2 - 0.03, l / 2 - 0.02, 0.58, M['linen'], 0.06)          # mattress
+    g.box(-w / 2 - 0.03, -l / 2 + 0.55, 0.42, w / 2 + 0.03, l / 2 + 0.03, 0.62, M['linen'], 0.08)          # duvet
+    g.box(-w / 2 - 0.05, l / 2 - 0.85, 0.43, w / 2 + 0.05, l / 2 + 0.05, 0.645, M['charcoal'], 0.05)       # coverlet
+    g.box(-w / 2 + 0.25, l / 2 - 0.75, 0.46, w / 2 - 0.25, l / 2 - 0.35, 0.665, throw or M['rust'], 0.04)  # throw
+    n = 2
+    pw = (w - 0.1) / n
+    for i in range(n):
+        x0 = -w / 2 + 0.05 + i * pw
+        g.box(x0 + 0.02, -l / 2 + 0.03, 0.55, x0 + pw - 0.02, -l / 2 + 0.20, 0.98, M['charcoal'], 0.09)   # euro sham
+        g.box(x0 + 0.06, -l / 2 + 0.17, 0.56, x0 + pw - 0.06, -l / 2 + 0.33, 0.86, M['linen'], 0.08)
+        g.box(x0 + 0.20, -l / 2 + 0.31, 0.56, x0 + pw - 0.20, -l / 2 + 0.43, 0.76, throw or M['rust'], 0.05)
     return g
 
-def nightstand(x, y, facing, cn=FU, name='Nightstand', with_lamp=True):
-    g = Group(name, x, y, facing, cn, 0.27, 0.22)
-    g.box(-0.26, -0.21, 0.0, 0.26, 0.21, 0.58, M['walnut'], 0.01)
-    g.box(-0.24, 0.205, 0.30, 0.24, 0.215, 0.55, M['walnut'], 0.004)
-    g.box(-0.05, 0.215, 0.42, 0.05, 0.23, 0.43, M['brass'], 0)
-    if with_lamp:
-        lamp(x, y, 0.58, cn, h=0.40, r=0.14, name=name + ' Lamp')
+def channel_headboard(x0, y0, x1, y1, z0, z1, mat, cn, wall_side='W', name='Upholstered Wall Panel'):
+    """vertical channel-tufted wall panel (plan ft)"""
+    horiz = abs(x1 - x0) > abs(y1 - y0)
+    n = int((abs(x1 - x0) if horiz else abs(y1 - y0)) / 0.55)
+    for i in range(n):
+        if horiz:
+            a = x0 + (x1 - x0) * i / n; b = x0 + (x1 - x0) * (i + 1) / n
+            box(a + 0.01, y0, b - 0.01, y1, z0, z1, mat, cn, name, 0.04)
+        else:
+            a = y0 + (y1 - y0) * i / n; b = y0 + (y1 - y0) * (i + 1) / n
+            box(x0, a + 0.01, x1, b - 0.01, z0, z1, mat, cn, name, 0.04)
+
+def floating_nightstand(x, y, facing, cn, name='Nightstand', pendant=True):
+    g = Group(name, x, y, facing, cn, 0.28, 0.22)
+    g.box(-0.28, -0.21, 0.30, 0.28, 0.21, 0.56, M['walnut'], 0.01)
+    g.box(-0.26, 0.205, 0.33, 0.26, 0.215, 0.53, M['walnut'], 0.003)
+    g.box(-0.10, 0.215, 0.42, 0.10, 0.225, 0.44, M['bronze'], 0)
+    X, Y = W(x, y)
+    vessel(x + 0.25, y + 0.1, 0.56, 0.05, 0.16, M['ceramic2'], cn, name + ' Vase')
+    stack(x - 0.2, y, 0.56, cn, 2, name + ' Books')
+    if pendant:
+        cylm(X, Y, 0.004, 1.15, CEIL, M['bronze'], cn, name + ' Pendant Cord', 6)
+        sphere(X, Y, 1.05, 0.12, M['alabaster'], cn, name + ' Pendant')
+        add_point(name + ' Pendant Light', X, Y, 1.05, 14, radius=0.12)
 
 def dresser(x, y, facing, w, cn=FU, name='Dresser'):
     g = Group(name, x, y, facing, cn, w / 2, 0.26)
-    g.box(-w / 2, -0.25, 0.10, w / 2, 0.25, 0.80, M['walnut'], 0.01)
-    for sx in (-w / 2 + 0.06, w / 2 - 0.06):
-        g.box(sx - 0.02, -0.2, 0, sx + 0.02, 0.2, 0.1, M['black'], 0)
-    cols = 3
-    cw = (w - 0.06) / cols
+    g.box(-w / 2, -0.25, 0.12, w / 2, 0.25, 0.80, M['navy'], 0.008)
+    g.box(-w / 2 + 0.05, -0.2, 0, w / 2 - 0.05, 0.2, 0.12, M['bronze'], 0.002)
+    cols = 2
+    cw = (w - 0.04) / cols
     for c in range(cols):
         for r in range(3):
-            x0 = -w / 2 + 0.03 + c * cw
-            z0 = 0.13 + r * 0.22
-            g.box(x0 + 0.005, 0.245, z0, x0 + cw - 0.005, 0.258, z0 + 0.205, M['walnut'], 0.003)
-            g.box(x0 + cw / 2 - 0.05, 0.258, z0 + 0.17, x0 + cw / 2 + 0.05, 0.27, z0 + 0.18, M['brass'], 0)
+            x0 = -w / 2 + 0.02 + c * cw; z0 = 0.15 + r * 0.215
+            g.box(x0 + 0.006, 0.245, z0, x0 + cw - 0.006, 0.258, z0 + 0.20, M['navy'], 0.002)
+            g.box(x0 + cw / 2 - 0.12, 0.258, z0 + 0.17, x0 + cw / 2 + 0.12, 0.268, z0 + 0.185, M['bronze'], 0)
+    g.box(-w / 2, -0.25, 0.80, w / 2, 0.25, 0.83, M['marble'], 0.003)
     return g
 
-def sofa_straight(g, x0, x1, y_back, depth, mat):
-    """add a straight sofa run inside group g, back at y_back, seat toward +y"""
-    g.box(x0, y_back, 0.08, x1, y_back + depth, 0.42, mat, 0.04)
-    g.box(x0, y_back, 0.42, x1, y_back + 0.22, 0.80, mat, 0.06)
-
 def toilet(x, y, facing, cn, name='Toilet'):
-    g = Group(name, x, y, facing, cn, 0.22, 0.36)
-    g.box(-0.20, -0.36, 0.40, 0.20, -0.18, 0.78, M['porcelain'], 0.03)
-    g.cyl(0, 0.02, 0.17, 0.0, 0.38, M['porcelain'], 24, ry=0.22, rx=0.17)
-    g.cyl(0, 0.04, 0.19, 0.38, 0.42, M['porcelain'], 24, ry=0.25, rx=0.19)
+    g = Group(name, x, y, facing, cn, 0.22, 0.34)
+    g.box(-0.19, -0.34, 0.35, 0.19, -0.20, 0.80, M['porcelain'], 0.03)
+    g.cyl(0, 0.02, 0.17, 0.0, 0.40, M['porcelain'], 28, rx=0.18, ry=0.24)
+    g.cyl(0, 0.03, 0.18, 0.40, 0.43, M['porcelain'], 28, rx=0.19, ry=0.25)
 
-def vanity(x0, y0, x1, y1, cn, sinks, wall_side, name='Vanity'):
-    """vanity footprint in plan ft; wall_side: 'E','W','N','S' side touching the wall"""
-    box(x0, y0, x1, y1, 0.12, 0.82, M['walnut'], cn, name, 0.008, obst=True, tag=name)
-    box(x0 - 0.05, y0 - 0.05, x1 + 0.05, y1 + 0.05, 0.82, 0.86, M['quartz'], cn, name + ' Top', 0.004)
+def vanity(x0, y0, x1, y1, cn, sinks, wall_side, name='Vanity', mirror=True):
+    """floating charcoal oak vanity, marble top, bronze faucets, backlit mirrors (plan ft)"""
+    box(x0, y0, x1, y1, 0.30, 0.82, M['navy'], cn, name, 0.006, obst=True, tag=name)
+    box(x0, y0, x1, y1, 0.28, 0.30, M['led'], cn, name + ' Toe LED')
+    box(x0 - 0.04, y0 - 0.04, x1 + 0.04, y1 + 0.04, 0.82, 0.86, M['marble'], cn, name + ' Top', 0.003)
+    off = {'E': (0.30, 0), 'W': (-0.30, 0), 'N': (0, 0.30), 'S': (0, -0.30)}[wall_side]
     for (sx, sy) in sinks:
         X, Y = W(sx, sy)
-        cylm(X, Y, 0.20, 0.86, 0.98, M['porcelain'], cn, name + ' Basin', 28, rx=0.22, ry=0.17)
-        cylm(X, Y, 0.18, 0.95, 0.981, M['steel'], cn, name + ' Basin Water', 28, rx=0.20, ry=0.15)
-        off = {'E': (0.28, 0), 'W': (-0.28, 0), 'N': (0, 0.28), 'S': (0, -0.28)}[wall_side]
-        cylm(X + off[0], Y + off[1], 0.015, 0.86, 1.15, M['brass'], cn, name + ' Faucet', 10)
-        dx = -off[0] * 0.35; dy = -off[1] * 0.35
-        boxm(X + off[0] - 0.015 + min(0, dx), Y + off[1] - 0.015 + min(0, dy), 1.12,
-             X + off[0] + 0.015 + max(0, dx), Y + off[1] + 0.015 + max(0, dy), 1.15, M['brass'], cn, name + ' Spout')
+        cylm(X, Y, 0.20, 0.861, 0.862, M['glass_black'], cn, name + ' Basin', 28, rx=0.22, ry=0.16)
+        fx, fy = X + off[0], Y + off[1]
+        cylm(fx, fy, 0.016, 0.86, 1.13, M['bronze'], cn, name + ' Faucet', 10)
+        boxm(min(fx, fx - off[0] * 0.4) - 0.012, min(fy, fy - off[1] * 0.4) - 0.012, 1.10,
+             max(fx, fx - off[0] * 0.4) + 0.012, max(fy, fy - off[1] * 0.4) + 0.012, 1.13, M['bronze'], cn, name + ' Spout')
+    return
+
+def backlit_mirror(x, y0, y1, z0, z1, cn, side='E', name='Backlit Mirror'):
+    """mirror on a wall running along plan y at plan x"""
+    d = 0.05 if side == 'E' else -0.05
+    box(x - d, y0, x, y1, z0, z1, M['mirror'], cn, name, 0.004)
+    box(x - d * 0.5, y0 - 0.06, x - d * 0.2, y1 + 0.06, z0 - 0.06, z1 + 0.06, M['led'], cn, name + ' Halo')
 
 def shower(x0, y0, x1, y1, glass_edges, cn, name='Shower', head=(None, None)):
-    box(x0, y0, x1, y1, 0.0, 0.012, M['shower_tile'], cn, name + ' Floor')
+    box(x0, y0, x1, y1, 0.0, 0.012, M['tile'], cn, name + ' Floor')
     for (ax, ay, bx, by) in glass_edges:
-        box(ax, ay, bx, by, 0.02, 2.0, M['shower_glass'], cn, name + ' Glass')
+        box(ax, ay, bx, by, 0.02, 2.05, M['shower_glass'], cn, name + ' Glass')
+        box(ax, ay, bx, by, 2.05, 2.07, M['bronze'], cn, name + ' Glass Rail')
         add_obst((ax + bx) / 2, (ay + by) / 2, abs(bx - ax) / 2 + 0.05, abs(by - ay) / 2 + 0.05, 0, name + ' Glass')
     if head[0] is not None:
         X, Y = W(*head)
-        cylm(X, Y, 0.11, 2.05, 2.07, M['black'], cn, name + ' Head', 24)
-        cylm(X, Y, 0.012, 2.07, CEIL, M['black'], cn, name + ' Arm', 8)
+        cylm(X, Y, 0.15, 2.30, 2.32, M['bronze'], cn, name + ' Rain Head', 28)
+        cylm(X, Y, 0.012, 2.32, CEIL, M['bronze'], cn, name + ' Arm', 8)
 
-def shelves_u(x0, y0, x1, y1, cn, name='Closet Shelving'):
-    """U shaped closet hang rails + shelves just inside the rectangle (plan ft)"""
-    d = 0.6 / F
-    for (a0, b0, a1, b1) in [(x0, y0, x0 + d, y1), (x1 - d, y0, x1, y1), (x0 + d, y1 - d, x1 - d, y1)]:
-        box(a0, b0, a1, b1, 1.78, 1.80, M['oak'], cn, name + ' Shelf')
-        box(a0, b0, a1, b1, 0.0, 0.10, M['oak'], cn, name + ' Base')
+def marble_walls(segments, cn, z1=CEIL, name='Marble Slab Wall'):
+    for (x0, y0, x1, y1) in segments:
+        box(x0, y0, x1, y1, 0.0, z1, M['marble'], cn, name)
+
+def closet_system(x0, y0, x1, y1, cn, name='Closet', open_sides='LRB'):
+    """charcoal oak closet with glass doors, LED rods, shelves and garments (plan ft)"""
+    d = 0.62 / F
+    runs = []
+    if 'L' in open_sides: runs.append((x0, y0, x0 + d, y1, 'v'))
+    if 'R' in open_sides: runs.append((x1 - d, y0, x1, y1, 'v'))
+    if 'B' in open_sides: runs.append((x0 + d, y1 - d, x1 - d, y1, 'h'))
+    for (a0, b0, a1, b1, o) in runs:
+        box(a0, b0, a1, b1, 0.0, 0.08, M['black'], cn, name + ' Plinth')
+        box(a0, b0, a1, b1, 2.35, 2.42, M['navy'], cn, name + ' Top')
+        box(a0, b0, a1, b1, 1.93, 1.95, M['led'], cn, name + ' LED Shelf')
         mx, my = (a0 + a1) / 2, (b0 + b1) / 2
-        if (a1 - a0) < (b1 - b0):
-            box(mx - 0.03, b0, mx + 0.03, b1, 1.65, 1.67, M['brass'], cn, name + ' Rod')
-            n = int((b1 - b0) / 0.5)
-            for i in range(n):
-                yy = b0 + 0.25 + i * 0.5
-                box(mx - 0.8, yy, mx + 0.8, yy + 0.08, 0.95 + random.uniform(0, 0.2), 1.62,
-                    random.choice([M['linen'], M['charcoal'], M['sage'], M['rust'], M['navy']]), cn, name + ' Garment')
+        L = (b1 - b0) if o == 'v' else (a1 - a0)
+        n = int(L / 0.42)
+        for i in range(n):
+            t = (b0 if o == 'v' else a0) + 0.25 + i * 0.42
+            h1 = random.uniform(0.95, 1.3)
+            col = random.choice([M['linen'], M['charcoal'], M['mushroom'], M['rust'], M['black_leather'], M['boucle']])
+            if o == 'v':
+                box(mx - 0.75, t, mx + 0.75, t + 0.10, 1.80 - h1, 1.78, col, cn, name + ' Garment', 0.02)
+            else:
+                box(t, my - 0.75, t + 0.10, my + 0.75, 1.80 - h1, 1.78, col, cn, name + ' Garment', 0.02)
+        if o == 'v':
+            box(mx - 0.03, b0, mx + 0.03, b1, 1.80, 1.82, M['bronze'], cn, name + ' Rod')
         else:
-            box(a0, my - 0.03, a1, my + 0.03, 1.65, 1.67, M['brass'], cn, name + ' Rod')
+            box(a0, my - 0.03, a1, my + 0.03, 1.80, 1.82, M['bronze'], cn, name + ' Rod')
+    add_obst((x0 + x1) / 2, (y0 + y1) / 2, 0.1, 0.1, 0, name)
 
-def bookshelf(x0, y0, x1, y1, cn, name='Bookshelf'):
-    box(x0, y0, x1, y1, 0, 1.9, M['oak'], cn, name + ' Body', 0.005, obst=True, tag=name)
-    horiz = (x1 - x0) > (y1 - y0)
-    for k in range(5):
-        z = 0.12 + k * 0.36
-        n = random.randint(6, 12)
-        if horiz:
-            xs = x0 + 0.15
-            for i in range(n):
-                wft = random.uniform(0.08, 0.15)
-                if xs + wft > x1 - 0.15: break
-                h = random.uniform(0.2, 0.3)
-                box(xs, y1, xs + wft, y1 + 0.02, z, z + h, random.choice(BOOK_MATS), cn, name + ' Book')
-                xs += wft + 0.01
-
-# ----------------------------------------------------------------------------
-# lights
-# ----------------------------------------------------------------------------
-LI = 'Lighting'
-def add_point(name, X, Y, Z, power, color=(1, 0.85, 0.7), radius=0.1):
-    d = bpy.data.lights.new(name, 'POINT')
-    d.energy = power; d.color = color; d.shadow_soft_size = radius
-    o = bpy.data.objects.new(name, d); o.location = (X, Y, Z)
-    link(o, LI)
-    return o
-
-AREA_SCALE = 0.45
-def area(name, x0, y0, x1, y1, power, color=(1.0, 0.86, 0.70), z=CEIL - 0.02):
-    d = bpy.data.lights.new(name, 'AREA')
-    d.shape = 'RECTANGLE'
-    d.size = abs(x1 - x0) * F * 0.8; d.size_y = abs(y1 - y0) * F * 0.8
-    d.energy = power * AREA_SCALE; d.color = color
-    o = bpy.data.objects.new(name, d)
-    X, Y = W((x0 + x1) / 2, (y0 + y1) / 2)
-    o.location = (X, Y, z)
-    link(o, LI)
-    return o
-
-def downlight(x, y, cn=LI):
-    X, Y = W(x, y)
-    cylm(X, Y, 0.06, CEIL - 0.004, CEIL - 0.001, M['bulb'], cn, 'Recessed Downlight', 16)
-    cylm(X, Y, 0.075, CEIL - 0.003, CEIL, M['trim'], cn, 'Downlight Trim', 16)
+def wine_wall(x0, y0, x1, y1, cn, name='Wine Wall'):
+    """glass-front, backlit wine display (plan ft, along the east wall)"""
+    box(x0, y0, x1, y1, 0.0, 2.40, M['navy'], cn, name + ' Case', 0.004, obst=True, tag=name)
+    box(x1 - 0.12, y0 + 0.15, x1 - 0.08, y1 - 0.15, 0.10, 2.30, M['led'], cn, name + ' Backlight')
+    bottle = bpy.data.meshes.new('Wine Bottle')
+    v, f = geo.cyl_data(0.037, 0, 0.24, 12)
+    v2, f2 = geo.cyl_data(0.013, 0.24, 0.31, 8)
+    off = len(v)
+    bottle.from_pydata(v + v2, [], f + [tuple(i + off for i in ff) for ff in f2]); bottle.update()
+    bottle.materials.append(principled('Wine Bottle Glass', (0.02, 0.05, 0.02), 0.08))
+    for ry in range(9):
+        z = 0.15 + ry * 0.24
+        box(x0 + 0.1, y0 + 0.1, x1 - 0.1, y1 - 0.1, z - 0.012, z, M['bronze'], cn, name + ' Rail')
+        yy = y0 + 0.35
+        while yy < y1 - 0.3:
+            o = bpy.data.objects.new('Wine Bottle', bottle)
+            X, Y = W((x0 + x1) / 2 + 0.3, yy)
+            o.location = (X, Y, z + 0.045); o.rotation_euler = (0, -math.pi / 2, 0)
+            link(o, cn)
+            yy += 0.30
+    box(x0 - 0.04, y0 + 0.05, x0, y1 - 0.05, 0.05, 2.35, M['glass'], cn, name + ' Glass Doors')
+    for yy in (y0 + 0.08, (y0 + y1) / 2, y1 - 0.08):
+        box(x0 - 0.05, yy - 0.03, x0, yy + 0.03, 0.03, 2.37, M['bronze'], cn, name + ' Door Frame')
+    area(name + ' Glow', x0 + 0.3, y0 + 0.4, x1 - 0.3, y1 - 0.4, 12, z=1.2, group='accent').rotation_euler = (0, math.radians(-90), 0)
 
 # ============================================================================
 # ROOMS
 # ============================================================================
 # ---------------- Kitchen ----------------------------------------------------
 K = 'Kitchen'
-box(43.9, 12.0, 45.88, 16.6, 0.0, 2.40, M['navy'], K, 'Pantry Cabinet', 0.006, obst=True)
-box(43.85, 12.0, 43.9, 16.6, 0.06, 2.34, M['navy'], K, 'Pantry Doors', 0.003)
-box(43.80, 14.25, 43.85, 14.35, 0.9, 1.4, M['brass'], K, 'Pantry Pull')
-box(43.6, 16.6, 45.88, 19.6, 0.0, 2.05, M['steel'], K, 'Refrigerator', 0.01, obst=True)
-box(43.55, 18.05, 43.6, 18.12, 0.9, 1.7, M['black'], K, 'Fridge Handle')
-box(43.55, 18.14, 43.6, 18.21, 0.9, 1.7, M['black'], K, 'Fridge Handle')
-box(43.9, 16.6, 45.88, 19.6, 2.05, 2.40, M['navy'], K, 'Fridge Upper')
-box(43.6, 19.6, 45.88, 31.4, 0.1, 0.86, M['navy'], K, 'Base Cabinets', 0.004, obst=True)
-box(43.7, 19.6, 45.88, 31.4, 0.0, 0.1, M['black'], K, 'Toe Kick')
-for yy in [x * 0.5 + 19.6 for x in range(0, 24)]:   # door/drawer reveal lines
-    box(43.585, yy - 0.01, 43.6, yy + 0.01, 0.12, 0.84, M['black'], K, 'Reveal')
-box(43.4, 19.6, 45.88, 31.4, 0.86, 0.91, M['quartz'], K, 'Counter', 0.003)
-box(45.80, 19.6, 45.88, 31.4, 0.91, 1.45, M['shower_tile'], K, 'Backsplash')
-box(43.7, 23.3, 45.6, 26.0, 0.91, 0.915, M['glass_black'], K, 'Cooktop')
-for (cy_, cx_) in [(23.9, 44.2), (25.4, 44.2), (23.9, 45.1), (25.4, 45.1)]:
-    cyl(cx_, cy_, 0.09, 0.915, 0.918, M['charcoal'], K, 'Burner', 20)
-box(44.2, 23.2, 45.88, 26.1, 1.62, CEIL, M['wall'], K, 'Range Hood', 0.01)
-box(44.15, 23.15, 45.88, 26.15, 1.58, 1.64, M['brass'], K, 'Hood Band', 0.004)
-for (a, b) in [(19.8, 23.0), (26.3, 31.2)]:   # open walnut shelves
-    for z in (1.40, 1.85):
-        box(44.9, a, 45.88, b, z, z + 0.04, M['walnut'], K, 'Open Shelf', 0.004)
-    for i in range(int((b - a) / 0.55)):
-        yy = a + 0.3 + i * 0.55
-        cyl(45.4, yy, 0.05, 1.44, 1.44 + random.choice([0.1, 0.16, 0.22]), random.choice([M['porcelain'], M['pot'], M['navy']]), K, 'Ceramic', 16)
-# L-return and wall ovens
-box(43.2, 31.4, 45.88, 33.75, 0.1, 0.86, M['navy'], K, 'Base Cabinets L', 0.004, obst=True)
-box(43.1, 31.4, 45.88, 33.75, 0.86, 0.91, M['quartz'], K, 'Counter L', 0.003)
-box(40.53, 31.65, 43.2, 33.75, 0.0, 2.40, M['navy'], K, 'Oven Tower', 0.006, obst=True)
-box(40.9, 31.6, 42.8, 31.65, 0.75, 1.30, M['glass_black'], K, 'Wall Oven')
-box(40.9, 31.6, 42.8, 31.65, 1.35, 1.80, M['glass_black'], K, 'Microwave')
-box(40.9, 31.58, 42.8, 31.6, 1.25, 1.27, M['steel'], K, 'Oven Handle')
-# island with waterfall quartz
-box(36.5, 21.4, 39.6, 28.0, 0.1, 0.88, M['navy'], K, 'Island Base', 0.004)
-box(35.8, 21.2, 39.8, 28.2, 0.88, 0.94, M['quartz'], K, 'Island Top', 0.004)
-box(35.8, 21.2, 39.8, 21.4, 0.0, 0.88, M['quartz'], K, 'Waterfall', 0.004)
-box(35.8, 28.0, 39.8, 28.2, 0.0, 0.88, M['quartz'], K, 'Waterfall', 0.004)
+wine_wall(43.9, 12.0, 45.88, 16.6, K)
+box(43.6, 16.6, 45.88, 19.6, 0.0, 2.40, M['navy'], K, 'Panel-Ready Refrigerator', 0.004, obst=True)
+for (z0, z1) in ((0.05, 1.55), (1.58, 2.38)):
+    box(43.585, 16.65, 43.6, 19.55, z0, z1, M['navy'], K, 'Fridge Panel', 0.002)
+box(43.53, 17.95, 43.585, 18.02, 0.75, 1.45, M['bronze'], K, 'Fridge Pull')
+box(43.53, 18.18, 43.585, 18.25, 0.75, 1.45, M['bronze'], K, 'Fridge Pull')
+box(43.6, 19.6, 45.88, 31.4, 0.10, 0.86, M['navy'], K, 'Base Cabinets', 0.003, obst=True)
+box(43.7, 19.6, 45.88, 31.4, 0.0, 0.10, M['led'], K, 'Toe Kick LED')
+for i in range(12):
+    yy = 19.6 + i * (31.4 - 19.6) / 12
+    box(43.585, yy + 0.01, 43.6, yy + (31.4 - 19.6) / 12 - 0.01, 0.12, 0.84, M['navy'], K, 'Cabinet Front', 0.002)
+    box(43.57, yy + 0.25, 43.585, yy + (31.4 - 19.6) / 12 - 0.25, 0.80, 0.815, M['bronze'], K, 'Edge Pull')
+box(43.4, 19.6, 45.88, 31.4, 0.86, 0.92, M['marble'], K, 'Marble Counter', 0.003)
+box(45.80, 19.6, 45.88, 31.4, 0.92, 2.40, M['marble'], K, 'Marble Slab Backsplash')
+box(43.75, 23.3, 45.55, 26.0, 0.92, 0.925, M['glass_black'], K, 'Induction Cooktop')
+box(44.25, 23.2, 45.80, 26.1, 1.62, CEIL, M['wall'], K, 'Plaster Range Hood', 0.02)
+box(44.20, 23.15, 45.80, 26.15, 1.58, 1.62, M['bronze'], K, 'Hood Band', 0.003)
+for (a, b) in [(19.8, 23.0), (26.3, 31.2)]:                    # floating oak shelves with LED
+    for z in (1.45, 1.90):
+        box(44.85, a, 45.80, b, z, z + 0.045, M['walnut'], K, 'Floating Shelf', 0.003)
+        box(44.90, a + 0.05, 45.75, b - 0.05, z - 0.003, z, M['led'], K, 'Shelf LED')
+    for z in (1.495, 1.945):
+        yy = a + 0.4
+        while yy < b - 0.4:
+            r = random.choice([0.05, 0.07, 0.09])
+            vessel(45.35, yy, z, r, random.choice([0.12, 0.2, 0.28]), random.choice([M['ceramic'], M['ceramic2'], M['porcelain']]), K, 'Ceramic')
+            yy += random.uniform(0.7, 1.1)
+area('Under-Shelf Wash', 44.0, 19.8, 45.7, 31.0, 30, z=1.44, group='accent')
+box(43.2, 31.4, 45.88, 33.75, 0.10, 0.86, M['navy'], K, 'Base Cabinets L', 0.003, obst=True)
+box(43.1, 31.4, 45.88, 33.75, 0.86, 0.92, M['marble'], K, 'Marble Counter L', 0.003)
+box(40.53, 31.65, 43.2, 33.75, 0.0, 2.40, M['navy'], K, 'Oven Tower', 0.004, obst=True)
+box(40.9, 31.6, 42.8, 31.65, 0.75, 1.32, M['glass_black'], K, 'Wall Oven')
+box(40.9, 31.6, 42.8, 31.65, 1.37, 1.82, M['glass_black'], K, 'Speed Oven')
+box(40.9, 31.57, 42.8, 31.60, 1.27, 1.29, M['bronze'], K, 'Oven Handle')
+box(40.9, 31.57, 42.8, 31.60, 1.77, 1.79, M['bronze'], K, 'Oven Handle')
+# island: marble waterfall, charcoal base, bronze foot rail
+box(36.5, 21.4, 39.6, 28.0, 0.10, 0.88, M['navy'], K, 'Island Base', 0.003)
+box(35.8, 21.2, 39.8, 28.2, 0.88, 0.95, M['marble'], K, 'Island Top', 0.003)
+box(35.8, 21.2, 39.8, 21.4, 0.0, 0.88, M['marble'], K, 'Waterfall', 0.003)
+box(35.8, 28.0, 39.8, 28.2, 0.0, 0.88, M['marble'], K, 'Waterfall', 0.003)
+box(36.3, 21.5, 36.4, 27.9, 0.20, 0.23, M['bronze'], K, 'Foot Rail')
 add_obst(37.8, 24.7, 2.0, 3.5, 0, 'Island')
-box(38.2, 23.9, 39.3, 25.6, 0.90, 0.941, M['steel'], K, 'Sink')
-cyl(39.45, 24.75, 0.018, 0.94, 1.32, M['brass'], K, 'Faucet', 10)
-box(39.0, 24.70, 39.47, 24.80, 1.30, 1.33, M['brass'], K, 'Faucet Spout')
+box(38.3, 23.9, 39.35, 25.6, 0.94, 0.951, M['steel'], K, 'Undermount Sink')
+cyl(39.5, 24.75, 0.018, 0.95, 1.36, M['bronze'], K, 'Faucet', 10)
+box(39.05, 24.70, 39.52, 24.80, 1.33, 1.36, M['bronze'], K, 'Faucet Spout')
+X, Y = W(37.0, 26.6)
+cylm(X, Y, 0.22, 0.95, 0.99, M['walnut'], K, 'Board', 24)
+for (dx, c) in ((-0.06, M['olive_leaf']), (0.07, M['rust']), (0.0, M['ceramic2'])):
+    sphere(X + dx, Y + dx * 0.5, 1.03, 0.045, c, K, 'Fruit')
+vessel(37.0, 23.0, 0.95, 0.10, 0.32, M['ceramic'], K, 'Island Vase')
+for i in range(5):
+    sphere(*W(37.0 + random.uniform(-0.2, 0.2), 23.0 + random.uniform(-0.2, 0.2)), 1.45 + random.uniform(0, 0.2), 0.05,
+           M['olive_leaf'], K, 'Branch Leaves', sx=1.5, sy=0.4, sz=0.4, seg=8)
 for yy in (22.9, 24.7, 26.5):
-    g = Group('Counter Stool', 34.9, yy, 'W', K, 0.24, 0.24)
-    g.cyl(0, 0, 0.21, 0.62, 0.67, M['walnut'], 24)
-    g.cyl(0, 0, 0.2, 0.25, 0.27, M['black'], 24, cap=False)
-    for a in range(4):
-        aa = a * math.pi / 2 + math.pi / 4
-        leg = g.box(-0.012, -0.012, 0, 0.012, 0.012, 0.63, M['black'], 0)
-        leg.location = (0.14 * math.cos(aa), 0.14 * math.sin(aa), 0)
-    g.box(-0.16, 0.12, 0.67, 0.16, 0.16, 0.85, M['walnut'], 0.01)
-for yy in (22.4, 24.7, 27.0):
+    g = Group('Counter Stool', 34.9, yy, 'W', K, 0.25, 0.25)
+    g.cyl(0, 0, 0.20, 0.0, 0.02, M['bronze'], 28)
+    g.cyl(0, 0, 0.03, 0.02, 0.62, M['bronze'], 10)
+    g.cyl(0, 0, 0.17, 0.30, 0.31, M['bronze'], 24, cap=False)
+    g.box(-0.22, -0.21, 0.62, 0.22, 0.21, 0.70, M['cognac'], 0.04)
+    g.box(-0.22, -0.24, 0.66, 0.22, -0.17, 0.95, M['cognac'], 0.04)
+for yy in (22.3, 24.7, 27.1):
     X, Y = W(37.8, yy)
-    cylm(X, Y, 0.005, 1.95, CEIL, M['black'], K, 'Pendant Cord', 6)
-    sphere(X, Y, 1.86, 0.17, M['copper'], K, 'Pendant', sz=0.6)
-    cylm(X, Y, 0.13, 1.79, 1.80, M['bulb'], K, 'Pendant Glow', 20)
-    add_point('Pendant Light', X, Y, 1.76, 35, (1.0, 0.78, 0.5), 0.08)
+    cylm(X, Y, 0.004, 1.95, CEIL, M['bronze'], K, 'Pendant Cord', 6)
+    sphere(X, Y, 1.85, 0.22, M['bronze'], K, 'Dome Pendant', sz=0.55)
+    cylm(X, Y, 0.17, 1.735, 1.74, M['bulb'], K, 'Pendant Diffuser', 24)
+    add_point('Island Pendant', X, Y, 1.70, 30, radius=0.1, group='accent')
 
 # ---------------- Dining ------------------------------------------------------
 D = 'Dining'
-box(31.0, 13.2, 39.0, 16.0, 0.72, 0.76, M['walnut'], D, 'Dining Table', 0.006)
-for (lx, ly) in [(31.6, 13.6), (38.4, 13.6), (31.6, 15.6), (38.4, 15.6)]:
-    box(lx - 0.12, ly - 0.12, lx + 0.12, ly + 0.12, 0, 0.72, M['walnut'], D, 'Table Leg')
+box(31.0, 13.2, 39.0, 16.0, 0.72, 0.77, M['walnut'], D, 'Dining Table', 0.01)
+for lx in (32.4, 37.6):
+    box(lx - 0.35, 13.9, lx + 0.35, 15.3, 0.0, 0.72, M['walnut'], D, 'Plinth Base', 0.01)
 add_obst(35.0, 14.6, 4.0, 1.4, 0, 'Dining Table')
 for xx in (32.4, 35.0, 37.6):
-    chair(xx, 12.85, 'S', M['boucle'], cn=D)
-    chair(xx, 16.35, 'N', M['boucle'], cn=D)
-chair(30.35, 14.6, 'E', M['boucle'], cn=D)
-chair(39.65, 14.6, 'W', M['boucle'], cn=D)
+    chair(xx, 12.85, 'S', M['mushroom'], cn=D)
+    chair(xx, 16.35, 'N', M['mushroom'], cn=D)
+chair(30.35, 14.6, 'E', M['black_leather'], cn=D)
+chair(39.65, 14.6, 'W', M['black_leather'], cn=D)
 X, Y = W(35.0, 14.6)
-boxm(X - 0.75, Y - 0.04, 1.86, X + 0.75, Y + 0.04, 1.90, M['brass'], D, 'Linear Chandelier')
-boxm(X - 0.72, Y - 0.025, 1.855, X + 0.72, Y + 0.025, 1.86, M['bulb'], D, 'Linear Chandelier Glow')
-for dx in (-0.6, 0.6):
-    cylm(X + dx, Y, 0.004, 1.90, CEIL, M['black'], D, 'Chandelier Cable', 6)
-add_point('Dining Light', X, Y, 1.80, 45, (1.0, 0.8, 0.55), 0.3)
-cyl(35.0, 14.6, 0.08, 0.76, 0.98, M['porcelain'], D, 'Vase', 20)
-for i in range(5):
-    sphere(X + random.uniform(-0.08, 0.08), Y + random.uniform(-0.08, 0.08), 1.02 + random.uniform(0, 0.12), 0.06, M['plant'], D, 'Stems', sx=0.6, sy=0.6, sz=1.6, seg=8)
+for (R, z) in ((0.75, 1.92), (0.55, 1.80), (0.35, 1.70)):     # tiered ring chandelier
+    torus(X, Y, z, R, 0.022, M['bronze'], D, 'Ring Chandelier')
+    torus(X, Y, z - 0.024, R, 0.008, M['led'], D, 'Ring Chandelier LED')
+    for k in range(3):
+        a = k * 2 * math.pi / 3 + R
+        cylm(X + R * math.cos(a), Y + R * math.sin(a), 0.003, z, CEIL, M['bronze'], D, 'Chandelier Cable', 5)
+add_point('Chandelier', X, Y, 1.65, 70, radius=0.5, group='accent')
+for (dx, h, m) in ((-0.9, 0.34, M['ceramic']), (-0.55, 0.22, M['ceramic2']), (0.7, 0.28, M['ceramic'])):
+    vessel(35.0 + dx * 1.5, 14.6, 0.77, 0.09, h, m, D, 'Centerpiece Vessel')
 
 # ---------------- Living --------------------------------------------------------
 L = 'Living'
-rug(18.9, 19.0, 27.2, 30.8, M['rug'], L, 'Living Rug')
-g = Group('Sectional Sofa', 26.55, 22.75, 'W', L, obst=False)     # leg facing the fireplace
+rug(18.9, 19.0, 27.4, 30.9, M['rug2'], L, 'Living Rug')
+g = Group('Sectional Sofa', 26.55, 22.75, 'W', L, obst=False)
 add_obst(26.55, 22.75, 1.55, 4.7, 0, 'Sectional (leg B)')
 add_obst(23.0, 19.55, 2.05, 1.45, 0, 'Sectional (leg A)')
-# local coords: +Y = west (toward fireplace).  Leg B: back along east side
-LB = 1.42  # half length in metres of leg B along world Y (plan y 18.1 .. 27.4); local -X = south
-g.box(-LB, -0.47, 0.08, LB, 0.47, 0.42, M['boucle'], 0.05)
-g.box(-LB, -0.47, 0.42, LB, -0.25, 0.80, M['boucle'], 0.06)
-g.box(-LB, -0.47, 0.0, -LB + 0.06, 0.47, 0.08, M['black'], 0)
-for k in range(3):   # seat cushions
-    a = -LB + 0.2 + k * 0.88
-    g.box(a + 0.01, -0.25, 0.42, a + 0.87, 0.45, 0.52, M['boucle'], 0.05)
-g.box(-LB, -0.47, 0.42, -LB + 0.20, 0.47, 0.62, M['boucle'], 0.05)       # arm (south end)
-# Leg A along north side (plan y 18.1-21.0), x 21.0-25.1, facing south
+LB = 1.42
+g.box(-LB, -0.47, 0.10, LB, 0.47, 0.40, M['boucle'], 0.06)
+g.box(-LB, -0.47, 0.40, LB, -0.22, 0.76, M['boucle'], 0.08)
+g.box(-LB + 0.05, -0.42, 0.0, LB - 0.05, 0.42, 0.10, M['black'], 0.005)
+for k in range(3):
+    a = -LB + 0.22 + k * 0.87
+    g.box(a + 0.01, -0.22, 0.40, a + 0.86, 0.46, 0.51, M['boucle'], 0.07)
+g.box(-LB, -0.47, 0.40, -LB + 0.22, 0.47, 0.58, M['boucle'], 0.07)
+for (px, m) in [(-0.95, M['rust']), (-0.55, M['charcoal']), (0.9, M['olive'])]:
+    g.box(px - 0.22, -0.22, 0.48, px + 0.22, -0.08, 0.88, m, 0.08)
+g.box(0.2, -0.3, 0.51, 0.75, 0.40, 0.55, M['charcoal'], 0.03)                  # folded throw
 g2 = Group('Sectional Sofa A', 23.05, 19.55, 'S', L, obst=False)
-# local +X = west here; the east end butts into leg B
-g2.box(-0.62, -0.44, 0.08, 0.62, 0.44, 0.42, M['boucle'], 0.05)
-g2.box(-0.62, -0.44, 0.42, 0.62, -0.22, 0.80, M['boucle'], 0.06)
-g2.box(0.42, -0.44, 0.42, 0.62, 0.44, 0.62, M['boucle'], 0.05)
-g2.box(-0.62, -0.22, 0.42, 0.41, 0.42, 0.52, M['boucle'], 0.05)
-for (px, m) in [(0.15, M['rust']), (-0.25, M['sage'])]:
-    g2.box(px - 0.2, -0.2, 0.5, px + 0.2, -0.08, 0.86, m, 0.06)
-for (px, m) in [(-0.9, M['rust']), (0.6, M['linen'])]:
-    g.box(px - 0.2, -0.24, 0.5, px + 0.2, -0.12, 0.86, m, 0.06)
-# coffee table (travertine look) + decor
-box(21.2, 23.0, 23.2, 28.0, 0.30, 0.38, M['quartz'], L, 'Coffee Table', 0.01, obst=True)
-box(21.5, 23.3, 22.9, 27.7, 0.0, 0.30, M['walnut'], L, 'Coffee Table Base', 0.01)
-for (yy, m) in [(24.2, BOOK_MATS[1]), (24.2, BOOK_MATS[2])]:
-    box(21.6, yy, 22.6, yy + 0.8, 0.38 + (0.03 if m == BOOK_MATS[2] else 0), 0.41 + (0.03 if m == BOOK_MATS[2] else 0), m, L, 'Coffee Book')
-cyl(22.2, 26.5, 0.12, 0.38, 0.45, M['brass'], L, 'Bowl', 24)
-armchair(23.05, 30.25, 'N', name='Living Lounge Chair', cn=L)
-box(25.4, 29.4, 27.2, 31.2, 0.0, 0.55, M['walnut'], L, 'Side Table', 0.02, obst=True)
-lamp(26.3, 30.3, 0.55, L, h=0.38, r=0.15, name='Side Table Lamp')
-plant(17.6, 32.6, L, 1.6, 0.24, 'Fiddle Leaf Plant')
-floor_lamp(19.9, 30.6, L, 'Reading Floor Lamp')
-# fireplace feature wall
-box(15.53, 24.15, 16.49, 29.34, 0.95, CEIL, M['stone'], L, 'Fireplace Surround')
-box(15.53, 24.15, 16.49, 29.34, 0.0, 0.25, M['stone'], L, 'Fireplace Hearth')
-box(15.53, 24.15, 15.60, 29.34, 0.25, 0.95, M['glass_black'], L, 'Firebox Back')
-box(15.6, 24.3, 16.3, 29.2, 0.25, 0.27, M['charcoal'], L, 'Firebox Bed')
-for i in range(9):
-    yy = 24.6 + i * 0.52
-    sphere(*W(15.95, yy), 0.31, 0.045, M['flame'], L, 'Flame', sx=0.45, sy=1.3, sz=random.uniform(2.2, 3.4), seg=10)
-    box(15.75, yy - 0.2, 16.15, yy + 0.2, 0.25, 0.29, M['log'], L, 'Ember Log', 0.01)
-add_point('Fireplace Glow', *W(16.2, 26.7), 0.5, 40, (1.0, 0.5, 0.2), 0.3)
-box(16.49, 24.15, 16.53, 29.34, 0.25, 0.95, M['glass'], L, 'Firebox Glass')
-box(16.49, 24.0, 16.62, 29.5, 0.95, 1.0, M['walnut'], L, 'Mantel', 0.004)
-box(16.49, 24.6, 16.55, 28.9, 1.35, 2.05, M['screen'], L, 'TV', 0.004)
-box(14.57, 22.95, 16.49, 24.12, 0.0, CEIL, M['stone'], L, 'Stone Pier')
-box(14.57, 29.34, 16.49, 30.56, 0.0, CEIL, M['stone'], L, 'Stone Pier')
-# firewood niche
-box(14.57, 18.54, 14.62, 22.95, 0, CEIL, M['walnut'], L, 'Niche Back')
-for z in (0.0, 0.9, 1.8):
+g2.box(-0.62, -0.44, 0.10, 0.62, 0.44, 0.40, M['boucle'], 0.06)
+g2.box(-0.62, -0.44, 0.40, 0.62, -0.20, 0.76, M['boucle'], 0.08)
+g2.box(0.40, -0.44, 0.40, 0.62, 0.44, 0.58, M['boucle'], 0.07)
+g2.box(-0.62, -0.20, 0.40, 0.39, 0.42, 0.51, M['boucle'], 0.07)
+g2.box(-0.57, -0.40, 0.0, 0.57, 0.40, 0.10, M['black'], 0.005)
+for (px, m) in [(0.12, M['rust']), (-0.3, M['charcoal'])]:
+    g2.box(px - 0.22, -0.2, 0.48, px + 0.22, -0.06, 0.88, m, 0.08)
+# round two-tier marble coffee table
+X, Y = W(22.2, 25.3)
+cylm(X, Y, 0.55, 0.0, 0.34, M['nero'], L, 'Drum Coffee Table', 48)
+cylm(X + 0.35, Y - 0.35, 0.38, 0.0, 0.42, M['marble'], L, 'Drum Coffee Table Upper', 48)
+add_obst(22.4, 25.6, 2.6, 2.6, 0, 'Coffee Tables')
+stack(22.3, 24.6, 0.34, L, 3)
+vessel(23.2, 26.5, 0.42, 0.11, 0.18, M['ceramic2'], L, 'Bowl')
+sphere(X + 0.38, Y - 0.40, 0.47, 0.05, M['bronze'], L, 'Sculpture Orb')
+lounge_chair(21.4, 30.0, 'N', M['cognac'], 'Living Lounge Chair L', L)
+lounge_chair(24.6, 30.0, 'N', M['cognac'], 'Living Lounge Chair R', L)
+X, Y = W(23.0, 30.4)
+cylm(X, Y, 0.22, 0.0, 0.5, M['bronze'], L, 'Drum Side Table', 32)
+lamp(23.0, 30.4, 0.5, L, h=0.32, r=0.13, name='Side Table Lamp', power=14)
+add_obst(23.0, 30.4, 0.75, 0.75, 0, 'Drum Side Table')
+olive_tree(17.7, 32.4, L, 2.2)
+arc_lamp(19.0, 18.7, 21.7, 21.9, L)
+# fireplace feature wall: book-matched Nero marble, linear fire, art above
+box(15.53, 24.15, 16.49, 29.34, 0.95, CEIL, M['nero'], L, 'Fireplace Surround')
+box(15.53, 24.15, 16.49, 29.34, 0.0, 0.30, M['nero'], L, 'Fireplace Hearth')
+box(15.53, 24.15, 15.60, 29.34, 0.30, 0.95, M['glass_black'], L, 'Firebox Back')
+box(15.6, 24.3, 16.3, 29.2, 0.30, 0.32, M['fire_glass'], L, 'Fire Glass Bed')
+for i in range(7):
+    X, Y = W(15.9 + random.uniform(-0.15, 0.15), 24.9 + i * 0.62)
+    geo.flame_sheet(X, Y, 0.31, 0.32, random.uniform(0.28, 0.42), False, M['flame'], L, 'Flame')
+add_point('Fireplace Glow', *W(16.3, 26.7), 0.55, 45, (1.0, 0.5, 0.2), 0.3, group='accent')
+box(16.49, 24.15, 16.53, 29.34, 0.30, 0.95, M['glass'], L, 'Firebox Glass')
+for (a, b) in ((22.95, 24.12), (29.34, 30.56)):
+    box(14.57, a, 16.49, b, 0.0, CEIL, M['nero'], L, 'Marble Pier')
+frame_art(16.52, 26.75, 'E', 1.45, 1.05, 1.75, M['art2'], L, 'Fireplace Art')
+# display niche (firewood below, styled shelves with LED above)
+box(14.57, 18.54, 14.62, 22.95, 0, CEIL, M['fluted'], L, 'Niche Back')
+for z in (0.0, 0.85, 1.45, 2.05):
     box(14.6, 18.54, 16.49, 22.95, z, z + 0.04, M['walnut'], L, 'Niche Shelf')
-for z0 in (0.04, 0.94):
-    for r in range(4):
-        for c in range(9):
-            xx = 15.5; yy = 18.85 + c * 0.47 + (0.23 if r % 2 else 0)
-            if yy > 22.75: continue
-            o = cylm(0, 0, random.uniform(0.045, 0.06), 0, 0.56, M['log'], L, 'Log', 9, smooth=False)
-            o.rotation_euler = (0, math.pi / 2, 0)
-            X, Y = W(14.65, yy)
-            o.location = (X, Y, z0 + 0.07 + r * 0.13)
-box(14.6, 18.54, 16.49, 22.95, 1.84, 1.86, M['oak'], L, 'Niche Shelf Top')
-for i, m in enumerate([M['pot'], M['porcelain'], M['brass']]):
-    cyl(15.4, 19.5 + i * 1.2, 0.07 + 0.02 * i, 1.86, 2.05 + 0.08 * i, m, L, 'Decor Vessel', 18)
-add_obst(15.5, 20.7, 1.0, 2.3, 0, 'Wood niche')
-frame_art(14.6, 32.8, 'E', 0.9, 1.2, 1.55, M['art2'], L, 'Living Art')
+    if z > 0:
+        box(14.65, 18.6, 16.4, 22.9, z - 0.004, z, M['led'], L, 'Niche LED')
+for r in range(5):
+    for c in range(9):
+        yy = 18.85 + c * 0.47 + (0.23 if r % 2 else 0)
+        if yy > 22.75: continue
+        o = cylm(0, 0, random.uniform(0.045, 0.06), 0, 0.56, M['log'], L, 'Log', 9, smooth=False)
+        o.rotation_euler = (0, math.pi / 2, 0)
+        X, Y = W(14.65, yy); o.location = (X, Y, 0.11 + r * 0.14)
+vessel(15.5, 19.6, 0.89, 0.09, 0.30, M['ceramic'], L, 'Niche Vase')
+books(21.1, 15.6, 0.89, 8, L, 'y')
+vessel(15.5, 20.2, 1.49, 0.12, 0.18, M['ceramic2'], L, 'Niche Bowl')
+sphere(*W(15.5, 22.2), 1.58, 0.08, M['bronze'], L, 'Niche Orb')
+books(18.8, 15.6, 2.09, 10, L, 'y')
+add_obst(15.5, 20.7, 1.0, 2.3, 0, 'Display niche')
+area('Niche Wash', 14.7, 18.7, 16.4, 22.8, 12, z=2.0, group='accent')
+curtain(18.9, 20.6, 11.0, 0.0, CEIL - 0.03, M['sheer'], L, 'Sheer Drapery')
+curtain(40.0, 41.7, 11.0, 0.0, CEIL - 0.03, M['sheer'], L, 'Sheer Drapery')
+box(18.8, 10.95, 41.8, 11.05, CEIL - 0.06, CEIL - 0.02, M['black'], L, 'Drapery Track')
+frame_art(14.6, 33.0, 'E', 1.0, 1.3, 1.55, M['art2'], L, 'Living Art')
 
-# ---------------- Den --------------------------------------------------------------
+# ---------------- Den / library ---------------------------------------------------------
 DN = 'Den'
-rug(17.6, 37.0, 25.6, 44.4, M['rug2'], DN, 'Den Rug')
-g = Group('Den Sleeper Sofa', 22.2, 44.6, 'N', DN, 1.25, 0.48)
-sofa_straight(g, -1.20, 1.20, -0.47, 0.94, M['sage'])
-g.box(-1.20, -0.47, 0.42, -1.02, 0.47, 0.64, M['sage'], 0.05)
-g.box(1.02, -0.47, 0.42, 1.20, 0.47, 0.64, M['sage'], 0.05)
-g.box(-0.98, -0.25, 0.42, 0.98, 0.45, 0.52, M['sage'], 0.05)
-g.box(-0.9, -0.24, 0.5, -0.5, -0.12, 0.86, M['linen'], 0.06)
-g.box(0.5, -0.24, 0.5, 0.9, -0.12, 0.86, M['rust'], 0.06)
-box(20.6, 39.6, 23.8, 41.6, 0.36, 0.40, M['walnut'], DN, 'Den Coffee Table', 0.008, obst=True)
-for (lx, ly) in [(20.8, 39.8), (23.6, 39.8), (20.8, 41.4), (23.6, 41.4)]:
-    cyl(lx, ly, 0.02, 0, 0.36, M['black'], DN, 'Leg', 8)
-box(25.5, 37.0, 27.5, 41.6, 0.72, 0.76, M['oak'], DN, 'Desk', 0.006, obst=True)
+rug(17.6, 37.0, 25.6, 44.4, M['rug'], DN, 'Den Rug')
+g = Group('Den Leather Sofa', 22.2, 44.6, 'N', DN, 1.25, 0.48)
+g.box(-1.20, -0.47, 0.12, 1.20, 0.47, 0.42, M['cognac'], 0.05)
+g.box(-1.20, -0.47, 0.42, 1.20, -0.25, 0.80, M['cognac'], 0.06)
+g.box(-1.20, -0.47, 0.42, -1.04, 0.47, 0.64, M['cognac'], 0.05)
+g.box(1.04, -0.47, 0.42, 1.20, 0.47, 0.64, M['cognac'], 0.05)
+g.box(-1.0, -0.25, 0.42, 1.0, 0.45, 0.52, M['cognac'], 0.05)
+for (px, m) in [(-0.7, M['linen']), (0.65, M['olive'])]:
+    g.box(px - 0.2, -0.24, 0.5, px + 0.2, -0.1, 0.86, m, 0.07)
+for (lx, ly) in [(-1.1, -0.4), (1.1, -0.4), (-1.1, 0.4), (1.1, 0.4)]:
+    g.box(lx - 0.02, ly - 0.02, 0, lx + 0.02, ly + 0.02, 0.12, M['bronze'], 0)
+X, Y = W(22.2, 40.6)
+cylm(X, Y, 0.42, 0.0, 0.38, M['walnut'], DN, 'Den Coffee Table', 40)
+stack(22.2, 40.6, 0.38, DN, 2)
+add_obst(22.2, 40.6, 1.45, 1.45, 0, 'Den Coffee Table')
+box(25.5, 37.0, 27.5, 41.6, 0.72, 0.77, M['walnut'], DN, 'Desk', 0.006, obst=True)
 for ly in (37.2, 41.4):
-    box(25.6, ly - 0.1, 27.4, ly + 0.1, 0.0, 0.72, M['black'], DN, 'Desk Leg')
-chair(24.7, 39.3, 'E', M['cognac'], 'Desk Chair', DN)
-lamp(27.0, 37.6, 0.76, DN, h=0.35, r=0.12, name='Desk Lamp')
-box(27.0, 39.0, 27.05, 40.6, 0.76, 1.12, M['screen'], DN, 'Monitor')
-bookshelf(17.2, 35.65, 21.6, 36.9, DN, 'Den Bookshelf')
-frame_art(27.45, 39.3, 'W', 1.2, 0.8, 1.55, M['art1'], DN, 'Den Art')
-plant(26.6, 44.8, DN, 1.2, 0.2, 'Den Plant')
+    box(25.6, ly - 0.08, 27.4, ly + 0.08, 0.0, 0.72, M['bronze'], DN, 'Desk Leg')
+chair(24.7, 39.3, 'E', M['black_leather'], 'Desk Chair', DN, M['bronze'])
+lamp(27.0, 37.6, 0.77, DN, h=0.38, r=0.12, name='Desk Lamp', power=12)
+box(27.38, 38.4, 27.45, 40.4, 1.0, 1.65, M['screen'], DN, 'Wall Display')
+# built-in library wall along the north side
+box(17.0, 35.43, 21.9, 35.6, 0.0, CEIL, M['navy'], DN, 'Library Back')
+add_obst(19.45, 36.17, 2.45, 0.74, 0, 'Library')
+for (a, b) in ((17.0, 17.15), (21.75, 21.9)):
+    box(a, 35.6, b, 36.9, 0.0, CEIL, M['navy'], DN, 'Library Side')
+box(17.15, 35.6, 21.75, 36.9, 0.0, 0.10, M['navy'], DN, 'Library Plinth')
+box(17.15, 35.6, 21.75, 36.9, 2.62, CEIL, M['navy'], DN, 'Library Top')
+for k in range(6):
+    z = 0.10 + k * 0.42
+    box(17.15, 35.6, 21.75, 36.9, z, z + 0.03, M['navy'], DN, 'Library Shelf')
+    box(17.15, 36.88, 21.75, 36.92, z, z + 0.03, M['bronze'], DN, 'Library Shelf Edge')
+    end = books(17.25, 36.6, z + 0.03, random.randint(14, 22), DN)
+    if end < 21.0:
+        vessel(min(21.4, end + 0.4), 36.5, z + 0.03, 0.06, 0.18, random.choice([M['ceramic'], M['ceramic2']]), DN, 'Shelf Object')
+    box(17.15, 35.65, 21.75, 36.85, z + 0.395, z + 0.399, M['led'], DN, 'Library LED')
+frame_art(27.45, 43.3, 'W', 0.9, 1.1, 1.5, M['art3'], DN, 'Den Art')
+plant(26.6, 44.8, DN, 1.3, 0.2, 'Den Plant')
+arc_lamp(19.0, 44.9, 20.8, 42.6, DN, 'Den Arc Lamp')
 
 # ---------------- Primary bedroom ------------------------------------------------
 PB = 'Primary Bedroom'
-rug(3.0, 6.0, 10.4, 15.2, M['rug'], PB, 'Primary Rug')
-bed(4.7, 10.6, 'E', 1.93, 2.13, PB, 'Primary King Bed')
-nightstand(1.65, 6.25, 'E', PB, 'Primary Nightstand L')
-nightstand(1.65, 14.95, 'E', PB, 'Primary Nightstand R')
+rug(3.0, 6.2, 10.6, 15.0, M['rug2'], PB, 'Primary Rug')
+channel_headboard(0.95, 4.5, 1.25, 16.7, 0.0, 1.55, M['mushroom'], PB)
+bed(4.75, 10.6, 'E', 1.93, 2.13, PB, 'Primary King Bed', panel=M['mushroom'])
+g = Group('Bed Bench', 8.8, 10.6, 'E', PB, 0.25, 0.7)
+g.box(-0.65, -0.22, 0.30, 0.65, 0.22, 0.46, M['cognac'], 0.04)
+for lx in (-0.6, 0.6):
+    g.box(lx - 0.02, -0.18, 0.0, lx + 0.02, 0.18, 0.30, M['bronze'], 0)
+floating_nightstand(1.95, 6.0, 'E', PB, 'Primary Nightstand L')
+floating_nightstand(1.95, 15.2, 'E', PB, 'Primary Nightstand R')
 dresser(13.15, 10.5, 'W', 1.75, PB, 'Primary Dresser')
-box(13.6, 9.0, 13.65, 12.0, 1.0, 1.85, M['screen'], PB, 'Bedroom TV')
-armchair(11.9, 3.7, -135, M['boucle'], 'Primary Reading Chair', PB)
-floor_lamp(13.3, 2.4, PB, 'Primary Floor Lamp')
-frame_art(0.62, 10.6, 'E', 1.5, 0.75, 1.75, M['art1'], PB, 'Primary Bed Art')
-plant(2.0, 2.4, PB, 1.3, 0.2, 'Primary Plant')
+frame_art(13.75, 10.5, 'W', 1.4, 0.9, 1.65, M['art3'], PB, 'Primary Dresser Art')
+vessel(13.2, 9.3, 0.83, 0.09, 0.30, M['ceramic'], PB, 'Dresser Vase')
+stack(13.2, 11.4, 0.83, PB, 3)
+lounge_chair(11.9, 3.7, -135, M['boucle'], 'Primary Lounge Chair', PB, M['black'])
+X, Y = W(10.6, 5.2)
+cylm(X, Y, 0.25, 0.0, 0.42, M['cognac'], PB, 'Ottoman', 28)
+add_obst(10.6, 5.2, 0.9, 0.9, 0, 'Ottoman')
+arc_lamp(13.4, 1.9, 12.3, 3.2, PB, 'Primary Reading Lamp')
+plant(2.2, 2.3, PB, 1.5, 0.22, 'Primary Plant')
+curtain(4.7, 6.2, 1.85, 0.0, CEIL - 0.03, M['sheer'], PB, 'Primary Sheers')
+curtain(12.1, 13.6, 1.85, 0.0, CEIL - 0.03, M['sheer'], PB, 'Primary Sheers')
 
 # ---------------- Primary bathroom -----------------------------------------------
 PBA = 'Primary Bath'
-shower(0.6, 18.55, 7.3, 22.0, [(1.6, 21.9, 7.3, 22.0), (7.25, 19.6, 7.35, 22.0)], PBA, 'Primary Shower', head=(3.5, 19.0))
-box(0.6, 18.55, 1.6, 22.0, 0.0, 0.46, M['quartz'], PBA, 'Shower Bench', 0.004)
-box(0.6, 18.55, 7.3, 18.65, 0.0, CEIL, M['shower_tile'], PBA, 'Shower Wall Tile')
-box(0.62, 18.55, 0.7, 22.0, 0.0, CEIL, M['shower_tile'], PBA, 'Shower Wall Tile')
+marble_walls([(0.6, 18.55, 7.3, 18.65), (0.62, 18.55, 0.72, 22.0), (0.62, 26.0, 0.72, 30.5)], PBA)
+shower(0.72, 18.65, 7.3, 22.0, [(1.6, 21.9, 7.3, 22.0), (7.25, 19.6, 7.35, 22.0)], PBA, 'Primary Shower', head=(3.8, 20.2))
+box(0.72, 18.65, 1.6, 22.0, 0.0, 0.46, M['marble'], PBA, 'Shower Bench', 0.004)
+box(0.73, 19.0, 0.78, 21.5, 1.2, 1.6, M['led'], PBA, 'Shower Niche LED')
 vanity(12.3, 21.9, 14.0, 30.4, PBA, [(13.2, 23.6), (13.2, 28.4)], 'E', 'Primary Vanity')
+box(13.95, 21.9, 14.0, 30.4, 0.86, 2.4, M['marble'], PBA, 'Vanity Marble Wall')
 for yy in (23.6, 28.4):
-    box(13.97, yy - 1.2, 14.0, yy + 1.2, 1.05, 2.0, M['mirror'], PBA, 'Mirror', 0.002)
-    box(13.95, yy - 1.25, 13.97, yy + 1.25, 1.02, 2.03, M['brass'], PBA, 'Mirror Frame')
-    for dy in (-1.45, 1.45):
-        X, Y = W(13.85, yy + dy)
-        cylm(X, Y, 0.04, 1.45, 1.75, M['lampshade'], PBA, 'Sconce', 16)
-# freestanding tub (hollow ellipse)
+    backlit_mirror(13.93, yy - 1.1, yy + 1.1, 1.08, 2.05, PBA, 'E')
+for (yy, m) in ((26.0, M['towel']),):
+    box(12.5, yy - 0.5, 13.3, yy + 0.5, 0.86, 0.96, m, PBA, 'Folded Towels', 0.02)
+vessel(13.0, 26.0, 0.96, 0.05, 0.14, M['ceramic'], PBA, 'Vanity Vessel')
 X, Y = W(4.2, 28.6)
-tub = cylm(X, Y, 1, 0.0, 0.58, M['porcelain'], PBA, 'Freestanding Tub', 40, rx=0.82, ry=0.38, cap=False)
-md = tub.modifiers.new('Solid', 'SOLIDIFY'); md.thickness = 0.06
-bpy.context.view_layer.objects.active = tub
-cylm(X, Y, 1, 0.0, 0.06, M['porcelain'], PBA, 'Tub Floor', 40, rx=0.80, ry=0.36)
-cylm(X, Y, 1, 0.38, 0.39, M['steel'], PBA, 'Tub Water', 40, rx=0.76, ry=0.33)
-add_obst(4.2, 28.6, 0.85 / F, 0.42 / F, 0, 'Tub')
-cyl(7.2, 29.3, 0.02, 0, 0.95, M['brass'], PBA, 'Tub Filler', 10)
-box(6.75, 29.25, 7.2, 29.35, 0.92, 0.95, M['brass'], PBA, 'Tub Filler Spout')
-plant(1.4, 26.2, PBA, 1.0, 0.16, 'Bath Plant')
-frame_art(0.62, 28.6, 'E', 1.0, 0.7, 1.55, M['art3'], PBA, 'Bath Art')
+tub = cylm(X, Y, 1, 0.0, 0.58, M['porcelain'], PBA, 'Freestanding Stone Tub', 48, rx=0.84, ry=0.40, cap=False)
+md = tub.modifiers.new('Solid', 'SOLIDIFY'); md.thickness = 0.07
+cylm(X, Y, 1, 0.0, 0.06, M['porcelain'], PBA, 'Tub Floor', 48, rx=0.80, ry=0.36)
+cylm(X, Y, 1, 0.40, 0.41, M['glass_black'], PBA, 'Tub Water', 48, rx=0.77, ry=0.33)
+add_obst(4.2, 28.6, 0.88 / F, 0.44 / F, 0, 'Tub')
+cyl(7.25, 29.3, 0.02, 0, 0.98, M['bronze'], PBA, 'Tub Filler', 10)
+box(6.8, 29.25, 7.25, 29.35, 0.95, 0.98, M['bronze'], PBA, 'Tub Filler Spout')
+X, Y = W(4.2, 28.6)
+cylm(X, Y, 0.004, 1.9, CEIL, M['bronze'], PBA, 'Tub Pendant Cord', 6)
+sphere(X, Y, 1.85, 0.16, M['alabaster'], PBA, 'Tub Pendant')
+add_point('Tub Pendant Light', X, Y, 1.85, 20, radius=0.16)
+box(2.3, 28.0, 2.9, 29.2, 0.58, 0.60, M['walnut'], PBA, 'Bath Caddy')
+X, Y = W(7.6, 27.2)
+cylm(X, Y, 0.17, 0.0, 0.45, M['walnut'], PBA, 'Bath Stool', 24)
+box(7.3, 26.95, 7.9, 27.45, 0.45, 0.53, M['towel'], PBA, 'Rolled Towel', 0.03)
+add_obst(7.6, 27.2, 0.6, 0.6, 0, 'Bath Stool')
+olive_tree(1.6, 25.0, PBA, 1.6, 'Bath Olive')
+frame_art(0.75, 28.6, 'E', 0.9, 0.6, 1.6, M['art1'], PBA, 'Bath Art', light=False)
+box(0.62, 30.6, 7.3, 34.6, 0, 0.01, M['nero'], PBA, 'WC Floor')
+marble_walls([(0.62, 33.9, 7.2, 34.0)], PBA, name='WC Nero Wall')
 toilet(1.6, 32.3, 'E', PBA, 'Primary Toilet')
-box(12.3, 30.6, 14.0, 34.6, 0.0, 2.2, M['walnut'], PBA, 'Linen Cabinet', 0.006, obst=True)
+box(12.3, 30.6, 14.0, 34.6, 0.0, 2.3, M['navy'], PBA, 'Linen Cabinet', 0.004, obst=True)
+box(12.28, 30.7, 12.3, 34.5, 1.0, 1.02, M['bronze'], PBA, 'Linen Pull')
 
 # ---------------- Primary closet ------------------------------------------------------
-shelves_u(5.1, 35.1, 13.9, 45.7, 'Primary Closet', 'Primary Closet')
-box(7.8, 39.0, 11.2, 42.0, 0, 0.92, M['oak'], 'Primary Closet', 'Closet Island', 0.006)
+closet_system(5.1, 35.1, 13.9, 45.7, 'Primary Closet', 'Primary Closet')
+box(7.8, 39.0, 11.2, 42.0, 0, 0.88, M['navy'], 'Primary Closet', 'Closet Island', 0.004)
+box(7.75, 38.95, 11.25, 42.05, 0.88, 0.92, M['marble'], 'Primary Closet', 'Closet Island Top', 0.003)
+X, Y = W(9.5, 40.5)
+torus(X, Y, 2.2, 0.35, 0.02, M['bronze'], 'Primary Closet', 'Closet Ring Light')
+torus(X, Y, 2.18, 0.35, 0.008, M['led'], 'Primary Closet', 'Closet Ring LED')
+lamp(8.4, 40.0, 0.92, 'Primary Closet', 0.3, 0.1, 'Closet Lamp', 10)
 
 # ---------------- Bedroom 2 ----------------------------------------------------------
 B2 = 'Bedroom 2'
-rug(51.0, 6.0, 57.8, 13.4, M['rug2'], B2, 'Bedroom 2 Rug')
-bed(56.0, 9.6, 'W', 1.6, 2.05, B2, 'Bedroom 2 Queen Bed')
-nightstand(58.4, 5.6, 'W', B2, 'Bedroom 2 Nightstand L')
-nightstand(58.4, 13.6, 'W', B2, 'Bedroom 2 Nightstand R')
+rug(51.0, 6.0, 57.8, 13.4, M['rug'], B2, 'Bedroom 2 Rug')
+channel_headboard(58.95, 5.0, 59.25, 14.2, 0.0, 1.35, M['charcoal'], B2)
+bed(56.15, 9.6, 'W', 1.6, 2.05, B2, 'Bedroom 2 Queen Bed', throw=M['olive'], panel=M['charcoal'])
+floating_nightstand(58.45, 5.9, 'W', B2, 'Bedroom 2 Nightstand L')
+floating_nightstand(58.45, 13.3, 'W', B2, 'Bedroom 2 Nightstand R')
 dresser(47.35, 9.6, 'E', 1.7, B2, 'Bedroom 2 Dresser')
-frame_art(46.48, 9.6, 'E', 1.0, 0.7, 1.45, M['art3'], B2, 'Bedroom 2 Dresser Art')
-frame_art(59.28, 9.6, 'W', 1.2, 0.6, 1.70, M['art2'], B2, 'Bedroom 2 Bed Art')
-armchair(48.4, 3.6, 135, M['sage'], 'Bedroom 2 Chair', B2)
-plant(54.5, 2.4, B2, 1.2, 0.2, 'Bedroom 2 Plant')
+frame_art(46.5, 9.6, 'E', 1.2, 0.9, 1.6, M['art2'], B2, 'Bedroom 2 Art')
+vessel(47.3, 8.3, 0.83, 0.08, 0.26, M['ceramic2'], B2, 'Dresser Vase')
+lounge_chair(48.4, 3.6, 135, M['olive'], 'Bedroom 2 Lounge Chair', B2, M['black'])
+plant(54.6, 2.4, B2, 1.3, 0.2, 'Bedroom 2 Plant')
+curtain(47.1, 48.6, 1.85, 0.0, CEIL - 0.03, M['sheer'], B2, 'Bedroom 2 Sheers')
+curtain(54.3, 55.8, 1.85, 0.0, CEIL - 0.03, M['sheer'], B2, 'Bedroom 2 Sheers')
 
-# ---------------- Bath 2, hall bath, closets, laundry, mech ---------------------------
+# ---------------- Bath 2, hall bath, closets, laundry, mech, entry --------------------------
 B2A = 'Bath 2'
-shower(53.0, 16.62, 59.28, 20.0, [(53.0, 19.9, 58.0, 20.0)], B2A, 'Bath 2 Shower', head=(56.0, 17.1))
-box(50.88, 16.62, 52.7, 18.24, 0.0, 2.3, M['oak'], B2A, 'Linen Tower', 0.005)
+marble_walls([(53.0, 16.62, 59.28, 16.72), (59.18, 16.62, 59.28, 20.0)], B2A)
+shower(53.0, 16.72, 59.18, 20.0, [(53.0, 19.9, 58.0, 20.0)], B2A, 'Bath 2 Shower', head=(56.0, 17.6))
+box(50.88, 16.62, 52.7, 18.24, 0.0, 2.3, M['navy'], B2A, 'Linen Tower', 0.004)
 vanity(57.6, 20.5, 59.28, 23.7, B2A, [(58.4, 22.1)], 'E', 'Bath 2 Vanity')
-box(59.25, 20.9, 59.28, 23.3, 1.05, 1.95, M['mirror'], B2A, 'Mirror')
+backlit_mirror(59.25, 21.0, 23.2, 1.05, 1.95, B2A, 'E')
+box(57.8, 23.0, 58.6, 23.6, 0.86, 0.95, M['towel'], B2A, 'Towels', 0.02)
 toilet(58.5, 26.3, 'W', B2A, 'Bath 2 Toilet')
-shelves_u(51.3, 28.5, 59.0, 37.8, 'Closet 2', 'Closet 2')
+closet_system(51.3, 28.5, 59.0, 37.8, 'Closet 2', 'Closet 2')
 HB = 'Hall Bath'
-shower(29.4, 35.6, 35.2, 38.6, [(29.4, 38.5, 34.0, 38.6)], HB, 'Hall Shower', head=(32.0, 36.0))
+marble_walls([(29.4, 35.6, 35.2, 35.7)], HB)
+shower(29.4, 35.7, 35.2, 38.6, [(29.4, 38.5, 34.0, 38.6)], HB, 'Hall Shower', head=(32.0, 36.6))
 vanity(28.0, 43.6, 31.3, 45.2, HB, [(29.6, 44.5)], 'S', 'Hall Vanity')
 box(28.4, 45.17, 30.8, 45.2, 1.05, 1.9, M['mirror'], HB, 'Mirror')
 toilet(33.3, 44.4, 'N', HB, 'Hall Toilet')
@@ -924,96 +908,108 @@ for xx in (46.0, 48.4):
     box(xx, 43.5, xx + 2.25, 45.6, 0.0, 0.95, M['porcelain'], LA, 'Washer/Dryer', 0.02)
     box(xx + 0.6, 43.45, xx + 1.65, 43.5, 0.25, 0.75, M['glass_black'], LA, 'Washer Door')
 box(50.9, 43.6, 54.6, 45.6, 0.1, 0.86, M['navy'], LA, 'Laundry Cabinet', 0.004)
-box(46.0, 43.4, 54.6, 45.6, 0.95, 0.99, M['quartz'], LA, 'Laundry Counter', 0.003)
+box(46.0, 43.4, 54.6, 45.6, 0.95, 0.99, M['marble'], LA, 'Laundry Counter', 0.003)
 box(46.0, 44.6, 54.6, 45.6, 1.45, 2.2, M['navy'], LA, 'Laundry Uppers', 0.004)
 cyl(57.4, 41.0, 0.28, 0.0, 1.5, M['porcelain'], 'Mech', 'Water Heater', 24)
-box(43.2, 38.9, 44.9, 45.5, 1.7, 1.72, M['oak'], 'Entry', 'Coat Closet Shelf')
-frame_art(42.62, 38.8, 'W', 0.6, 0.8, 1.55, M['art2'], 'Entry', 'Entry Art')
+box(43.2, 38.9, 44.9, 45.5, 1.7, 1.72, M['walnut'], 'Entry', 'Coat Closet Shelf')
+EN = 'Entry'
+box(41.6, 38.6, 42.62, 40.3, 0.78, 0.83, M['nero'], EN, 'Entry Console Top', 0.003)
+for yy in (38.75, 40.15):
+    box(41.7, yy - 0.06, 42.55, yy + 0.06, 0.0, 0.78, M['bronze'], EN, 'Console Leg')
+add_obst(42.1, 39.45, 0.55, 0.9, 0, 'Entry Console')
+vessel(42.1, 38.95, 0.83, 0.10, 0.36, M['ceramic'], EN, 'Entry Vase')
+for i in range(6):
+    sphere(*W(42.1 + random.uniform(-0.25, 0.25), 38.95 + random.uniform(-0.25, 0.25)), 1.35 + random.uniform(0, 0.35),
+           0.05, M['olive_leaf'], EN, 'Entry Branches', sx=1.6, sy=0.4, sz=0.4, seg=8)
+lamp(42.1, 39.9, 0.83, EN, 0.32, 0.12, 'Entry Lamp', 12)
+frame_art(42.62, 39.45, 'W', 1.0, 1.25, 1.6, M['art1'], EN, 'Entry Art')
+X, Y = W(37.9, 40.5)
+cylm(X, Y, 0.004, 2.4, CEIL, M['bronze'], EN, 'Entry Pendant Cord', 6)
+sphere(X, Y, 2.3, 0.15, M['alabaster'], EN, 'Entry Pendant')
+add_point('Entry Pendant Light', X, Y, 2.0, 25, radius=0.2)
 
-# ---------------- Balcony furniture ---------------------------------------------------
+# ---------------- Balcony -------------------------------------------------------
 BA = 'Balcony'
-armchair(16.4, 3.2, 'E', M['charcoal'], 'Balcony Lounge Chair', BA)
-armchair(16.4, 7.4, 'E', M['charcoal'], 'Balcony Lounge Chair', BA)
-box(19.2, 3.9, 21.1, 6.8, 0.0, 0.40, M['oak'], BA, 'Balcony Coffee Table', 0.01, obst=True)
+armchair(16.4, 3.2, 'E', M['outdoor'], 'Balcony Lounge Chair', BA)
+armchair(16.4, 7.4, 'E', M['outdoor'], 'Balcony Lounge Chair', BA)
+# gas fire table (lit from golden hour on)
+box(19.0, 3.6, 21.4, 7.1, 0.0, 0.40, M['nero'], BA, 'Fire Table', 0.01, obst=True)
+box(19.4, 4.4, 21.0, 6.3, 0.40, 0.41, M['fire_glass'], BA, 'Fire Table Glass')
+for i in range(4):
+    X, Y = W(20.2 + random.uniform(-0.2, 0.2), 4.8 + i * 0.45)
+    geo.flame_sheet(X, Y, 0.41, 0.3, random.uniform(0.25, 0.35), False, M['fire_table'], BA, 'Fire Table Flames')
+_ft = add_point('Fire Table Glow', *W(20.2, 5.35), 0.7, 60, (1.0, 0.5, 0.2), 0.3, group='firetable')
 g = Group('Balcony Sofa', 23.0, 6.0, 'W', BA, 1.07, 0.47)
-sofa_straight(g, -1.05, 1.05, -0.45, 0.9, M['charcoal'])
-g.box(-1.05, -0.45, 0.42, -0.9, 0.45, 0.6, M['charcoal'], 0.04)
-g.box(0.9, -0.45, 0.42, 1.05, 0.45, 0.6, M['charcoal'], 0.04)
-g.box(-0.6, -0.25, 0.48, -0.2, -0.12, 0.8, M['rust'], 0.05)
-box(32.6, 4.2, 38.0, 7.2, 0.72, 0.76, M['oak'], BA, 'Balcony Dining Table', 0.006)
+g.box(-1.05, -0.45, 0.06, 1.05, 0.45, 0.40, M['outdoor'], 0.05)
+g.box(-1.05, -0.45, 0.40, 1.05, -0.24, 0.76, M['outdoor'], 0.06)
+g.box(-1.05, -0.45, 0.0, 1.05, 0.45, 0.06, M['black'], 0.003)
+g.box(-1.05, -0.45, 0.40, -0.92, 0.45, 0.58, M['outdoor'], 0.04)
+g.box(0.92, -0.45, 0.40, 1.05, 0.45, 0.58, M['outdoor'], 0.04)
+g.box(-0.6, -0.24, 0.46, -0.2, -0.1, 0.8, M['rust'], 0.06)
+g.box(0.3, -0.24, 0.46, 0.7, -0.1, 0.8, M['charcoal'], 0.06)
+box(32.6, 4.2, 38.0, 7.2, 0.72, 0.76, M['teak'], BA, 'Balcony Dining Table', 0.006)
 for (lx, ly) in [(32.9, 4.5), (37.7, 4.5), (32.9, 6.9), (37.7, 6.9)]:
     cyl(lx, ly, 0.03, 0, 0.72, M['black'], BA, 'Leg', 8)
 add_obst(35.3, 5.7, 2.7, 1.5, 0, 'Balcony Table')
 for xx in (34.0, 36.6):
-    chair(xx, 3.35, 'S', M['charcoal'], 'Balcony Chair', BA)
-    chair(xx, 8.05, 'N', M['charcoal'], 'Balcony Chair', BA)
-chair(31.8, 5.7, 'E', M['charcoal'], 'Balcony Chair', BA)
-chair(38.8, 5.7, 'W', M['charcoal'], 'Balcony Chair', BA)
-box(42.6, 2.2, 44.9, 9.4, 0.0, 0.92, M['steel'], BA, 'Outdoor Kitchen', 0.01, obst=True)
-box(42.6, 2.2, 44.9, 9.4, 0.92, 0.95, M['stone'], BA, 'Outdoor Counter', 0.004)
-plant(44.5, 10.3, BA, 1.4, 0.25, 'Balcony Plant')
-plant(15.9, 10.2, BA, 1.0, 0.2, 'Balcony Plant')
+    chair(xx, 3.35, 'S', M['outdoor'], 'Balcony Chair', BA, M['black'])
+    chair(xx, 8.05, 'N', M['outdoor'], 'Balcony Chair', BA, M['black'])
+chair(31.8, 5.7, 'E', M['outdoor'], 'Balcony Chair', BA, M['black'])
+chair(38.8, 5.7, 'W', M['outdoor'], 'Balcony Chair', BA, M['black'])
+box(42.6, 2.2, 44.9, 9.4, 0.0, 0.92, M['navy'], BA, 'Outdoor Kitchen', 0.006, obst=True)
+box(42.5, 2.1, 44.95, 9.5, 0.92, 0.97, M['nero'], BA, 'Outdoor Counter', 0.003)
+box(43.4, 4.2, 44.6, 6.6, 0.97, 1.0, M['steel'], BA, 'Built-in Grill')
+for (x0, x1) in ((15.4, 18.6), (38.6, 42.0)):                     # long planters of seasonal grasses
+    box(x0, 0.7, x1, 2.0, 0.0, 0.55, M['concrete'], BA, 'Planter', 0.01)
+    add_obst((x0 + x1) / 2, 1.35, (x1 - x0) / 2, 0.65, 0, 'Planter')
+    if 'Grass Clump' not in bpy.data.meshes:
+        gv, gf = [], []
+        for bl in range(26):                      # one clump = 26 arching blades
+            a = random.uniform(0, 2 * math.pi); lean = random.uniform(0.05, 0.25); hh = random.uniform(0.35, 0.6)
+            bx, by = math.cos(a) * 0.03, math.sin(a) * 0.03
+            tx, ty = bx + math.cos(a) * lean, by + math.sin(a) * lean
+            px, py = -math.sin(a) * 0.006, math.cos(a) * 0.006
+            k0 = len(gv)
+            gv += [(bx - px, by - py, 0), (bx + px, by + py, 0), ((bx + tx) / 2 + px * 0.6, (by + ty) / 2 + py * 0.6, hh * 0.65),
+                   ((bx + tx) / 2 - px * 0.6, (by + ty) / 2 - py * 0.6, hh * 0.65), (tx, ty, hh)]
+            gf += [(k0, k0 + 1, k0 + 2, k0 + 3), (k0 + 3, k0 + 2, k0 + 4)]
+        gme = bpy.data.meshes.new('Grass Clump'); gme.from_pydata(gv, [], gf); gme.update(); gme.materials.append(M['planting'])
+    gme = bpy.data.meshes['Grass Clump']
+    for i in range(22):
+        o = bpy.data.objects.new('Grass Clump', gme)
+        X, Y = W(random.uniform(x0 + 0.3, x1 - 0.3), random.uniform(0.95, 1.75))
+        o.location = (X, Y, 0.53); o.rotation_euler = (0, 0, random.uniform(0, 6.3)); s = random.uniform(0.8, 1.3)
+        o.scale = (s, s, s)
+        link(o, BA)
+for x in (17.0, 23.0, 29.0, 35.0, 41.0):
+    downlight(x, 5.5, 22)
 
 # ---------------- ceiling lighting -------------------------------------------------
-for (x, y) in [(20, 14), (25, 14), (20, 22), (20, 28), (24, 25), (30, 22), (30, 28), (33, 32.5),
-               (41.6, 21), (41.6, 25), (41.6, 29), (37.6, 37), (37.6, 42), (44, 36), (48.5, 20), (48.5, 25),
-               (48.5, 31), (6, 5), (10, 5), (6, 15), (11, 14.5), (21, 38), (24, 42), (9.6, 21), (9.6, 26),
-               (4, 24.5), (52, 6), (52, 12), (55, 22), (31.5, 41)]:
+for (x, y) in [(20, 14), (25, 14), (19.5, 22), (19.5, 28), (24.5, 25), (30, 22), (30, 28), (33, 32.5),
+               (41.6, 21), (41.6, 25), (41.6, 29), (37.6, 37), (37.6, 43), (44, 36), (48.5, 20), (48.5, 25),
+               (48.5, 31), (6, 4), (10, 4), (6, 16.5), (11, 14.5), (21, 38), (24, 42), (9.6, 21), (9.6, 26),
+               (4, 24.5), (52, 6), (52, 12.5), (55, 22), (31.5, 41), (9.5, 37.5), (9.5, 43.5), (55, 31), (55, 35),
+               (50, 41), (3.5, 32.3)]:
     downlight(x, y)
-area('Living Fill', 17.5, 13, 29, 32, 260)
-area('Kitchen Fill', 33, 19, 45, 32, 220)
-area('Dining Fill', 30, 12.5, 40, 18, 110)
-area('Entry Fill', 35.8, 34.5, 45.5, 44.5, 140)
-area('Hall Fill', 46.5, 16.6, 50.4, 38, 90)
-area('Den Fill', 16.8, 35.6, 27.4, 45.6, 140)
-area('Primary Bedroom Fill', 0.8, 1.6, 13.8, 17.8, 220)
-area('Primary Bath Fill', 0.8, 18.6, 13.8, 34.4, 200)
-area('Bedroom 2 Fill', 46.6, 1.6, 59.2, 16.0, 200)
-area('Bath 2 Fill', 51, 16.7, 59.2, 27.8, 110)
-area('Laundry Fill', 45.7, 38.8, 59.2, 45.6, 80)
-area('Closet Fill', 5.1, 35.1, 13.9, 45.7, 80)
-area('Closet 2 Fill', 51.2, 28.4, 59.1, 37.9, 60)
-area('Hall Bath Fill', 27.9, 35.6, 35.2, 45.4, 70)
-area('Balcony Soffit', 16, 1, 45, 10.5, 150)
+area('Living Fill', 17.5, 13, 29, 32, 70)
+area('Kitchen Fill', 33, 19, 45, 32, 60)
+area('Dining Fill', 30, 12.5, 40, 18, 30)
+area('Entry Fill', 35.8, 34.5, 45.5, 44.5, 45)
+area('Hall Fill', 46.5, 16.6, 50.4, 38, 30)
+area('Den Fill', 16.8, 35.6, 27.4, 45.6, 45)
+area('Primary Bedroom Fill', 0.8, 1.6, 13.8, 17.8, 60)
+area('Primary Bath Fill', 0.8, 18.6, 13.8, 34.4, 60)
+area('Bedroom 2 Fill', 46.6, 1.6, 59.2, 16.0, 55)
+area('Bath 2 Fill', 51, 16.7, 59.2, 27.8, 35)
+area('Laundry Fill', 45.7, 38.8, 59.2, 45.6, 30)
+area('Closet Fill', 5.1, 35.1, 13.9, 45.7, 35)
+area('Closet 2 Fill', 51.2, 28.4, 59.1, 37.9, 25)
+area('Hall Bath Fill', 27.9, 35.6, 35.2, 45.4, 25)
 
-# sun + sky
-sun_d = bpy.data.lights.new('Sun', 'SUN'); sun_d.energy = 4.0; sun_d.angle = math.radians(1.5)
-sun_d.color = (1.0, 0.93, 0.83)
-sun = bpy.data.objects.new('Sun', sun_d); sun.rotation_euler = (math.radians(55), 0, math.radians(200))
-link(sun, LI)
-world = bpy.data.worlds.new('World'); scene.world = world
-world.use_nodes = True
-wn = world.node_tree
-bg = wn.nodes['Background']
-try:
-    sky = wn.nodes.new('ShaderNodeTexSky')
-    sky.sky_type = 'NISHITA' if 'NISHITA' in [i.identifier for i in sky.bl_rna.properties['sky_type'].enum_items] else sky.sky_type
-    sky.sun_elevation = math.radians(35); sky.sun_rotation = math.radians(200)
-    wn.links.new(sky.outputs['Color'], bg.inputs['Color'])
-    bg.inputs['Strength'].default_value = 0.12
-except Exception as e:
-    print('sky fallback', e)
-    bg.inputs['Color'].default_value = (0.55, 0.70, 0.95, 1)
-    bg.inputs['Strength'].default_value = 1.0
-
-# ---------------- surroundings (seen through the glass) -------------------------------------
-EX = 'Exterior'
-boxm(-140, -60, -7.5, 160, 200, -7.4, M['ground'], EX, 'Ground')
-boxm(-140, 28, -7.399, 160, 40, -7.39, M['road'], EX, 'Street')
-for i in range(14):
-    x = -70 + i * 13 + random.uniform(-3, 3)
-    w = random.uniform(8, 12); d = random.uniform(10, 16); h = random.uniform(6, 26)
-    boxm(x, 60, -7.4, x + w, 60 + d, -7.4 + h, random.choice([M['facade'], M['facade2']]), EX, 'Neighbour Building')
-    # window bands
-    for k in range(int(h / 3.2)):
-        boxm(x + 0.5, 59.95, -6 + k * 3.2, x + w - 0.5, 60.01, -4.8 + k * 3.2, M['glass_black'], EX, 'Neighbour Windows')
-for i in range(26):
-    x = -60 + i * 6 + random.uniform(-2, 2); y = random.uniform(14, 26)
-    cylm(x, y, 0.18, -7.4, -4.2, M['walnut'], EX, 'Tree Trunk', 8)
-    sphere(x, y, -2.8, random.uniform(1.8, 2.6), M['plant'], EX, 'Tree Canopy', seg=12)
-for i in range(8):
-    x = -40 + i * 15
-    sphere(x, 48, -2.0, 3.5, M['plant'], EX, 'Tree Canopy', seg=12)
+# ---------------- sky, sun and the Omaha surroundings -----------------------------------
+env.build_world(scene)
+env.build_exterior()
+env.set_season(VIDEO_SEASON)
 
 # ============================================================================
 # CAMERA PATH
@@ -1022,11 +1018,14 @@ for i in range(8):
 WAYPOINTS = [
     (37.6, 44.3, 0.55, (37.6, 30.0)),   # front door, looking up the entry hall
     (37.6, 40.0, 0.95, None),
-    (37.5, 35.4, 0.90, (30.0, 36.0)),
-    (34.4, 33.6, 0.80, (25.0, 38.0)),   # passing the den - looking in through its opening
-    (30.5, 33.3, 0.60, (24.0, 39.5)),
-    (27.2, 33.0, 0.45, (23.5, 41.0)),
-    (28.0, 31.9, 0.45, (21.0, 40.0)),
+    (37.5, 35.4, 0.90, (28.0, 30.0)),
+    (34.4, 33.6, 0.80, (22.0, 31.5)),   # passing the den
+    (30.5, 33.4, 0.65, (21.0, 33.5)),
+    (26.4, 33.5, 0.50, (23.5, 40.5)),   # step into the den doorway
+    (23.6, 35.5, 0.35, (22.5, 42.0)),
+    (23.8, 36.6, 0.28, (20.0, 40.0)),
+    (24.7, 35.1, 0.35, (28.0, 31.0)),
+    (27.0, 32.6, 0.50, (30.0, 28.0)),
     (30.8, 30.6, 0.60, (38.0, 27.0)),
     (34.0, 29.9, 0.95, (41.6, 27.0)),
     (38.4, 30.0, 1.00, None),
@@ -1049,23 +1048,24 @@ WAYPOINTS = [
     (11.6, 16.2, 0.70, (4.5, 10.0)),    # bedroom, looking at the bed
     (9.9, 17.1, 0.80, (9.6, 26.0)),
     (9.4, 18.4, 0.85, None),            # primary bath door
-    (8.9, 21.3, 0.80, (4.2, 26.5)),
-    (8.8, 24.8, 0.70, (4.2, 28.6)),     # tub & shower
-    (10.0, 27.4, 0.45, (13.5, 26.5)),
-    (11.0, 25.2, 0.50, (13.5, 23.0)),   # double vanity
-    (9.9, 22.3, 0.80, (9.6, 16.0)),
+    (9.0, 21.0, 0.80, (4.2, 27.0)),
+    (8.9, 24.0, 0.60, (4.0, 29.0)),     # freestanding tub
+    (9.6, 26.2, 0.38, (2.5, 22.0)),     # shower & olive tree
+    (10.5, 24.0, 0.45, (13.0, 26.5)),   # vanity, at an angle
+    (9.8, 21.6, 0.75, (9.6, 16.0)),
     (9.7, 18.4, 0.95, None),
-    (11.2, 16.6, 1.00, (15.0, 16.2)),
+    (10.6, 17.0, 0.95, (30.0, 16.5)),   # look back out toward the great room
+    (12.5, 15.9, 1.00, (30.0, 16.5)),
     (14.36, 16.25, 1.05, None),
     (18.5, 16.7, 1.10, None),
     (25.0, 16.8, 1.10, None),
     (29.1, 17.4, 1.05, None),
     (31.4, 20.4, 1.05, None),
-    (32.0, 29.5, 1.10, None),
-    (36.0, 32.6, 1.10, None),
-    (40.5, 35.9, 1.10, None),
-    (45.0, 36.2, 1.05, None),
-    (48.5, 34.0, 1.00, (48.5, 20.0)),   # bedroom hallway
+    (32.0, 29.5, 1.10, (40.0, 36.0)),
+    (36.0, 32.6, 1.15, (47.0, 36.5)),
+    (40.5, 35.9, 1.20, (49.0, 35.0)),
+    (45.0, 36.2, 1.15, (49.5, 30.0)),
+    (48.5, 34.0, 1.00, (48.5, 16.0)),   # bedroom hallway
     (48.4, 28.1, 1.00, None),
     (48.45, 21.0, 1.00, None),
     (48.5, 16.4, 0.85, None),           # bedroom 2
@@ -1258,23 +1258,36 @@ json.dump(dict(report=report, frames=[(round(x, 3), round(y, 3), round(a, 4)) fo
           open(os.path.join(HERE, 'camera_report.json'), 'w'))
 
 # ----------------------------------------------------------------------------
-# render defaults (EEVEE) + save
+# day cycle for the walkthrough: morning at the door -> golden hour on the balcony -> evening
 # ----------------------------------------------------------------------------
-scene.render.engine = 'BLENDER_EEVEE'
-ee = scene.eevee
-for attr, val in [('taa_render_samples', 32), ('use_shadows', True), ('use_raytracing', True),
-                  ('shadow_ray_count', 1), ('shadow_step_count', 4), ('use_fast_gi', True)]:
-    try:
-        setattr(ee, attr, val)
-    except Exception as e:
-        print('eevee attr', attr, e)
-try:
-    ee.ray_tracing_options.resolution_scale = '2'
-except Exception:
-    pass
+bal = [i for i, (x, y, _) in enumerate(frames) if y < 11.0 and 15 < x < 46]
+t_bal = (bal[0] + bal[-1]) / 2 / FPS if bal else 19.0
+DAY_KEYS = [(0.0, 0.0), (t_bal * 0.55, 1.0), (t_bal, 2.0), (t_bal + 8.0, 2.55), (min(DURATION, t_bal + 17.0), 3.0), (DURATION, 3.0)]
+def t_at(sec):
+    for (s0, t0), (s1, t1) in zip(DAY_KEYS, DAY_KEYS[1:]):
+        if sec <= s1:
+            f = 0 if s1 == s0 else (sec - s0) / (s1 - s0)
+            return t0 + (t1 - t0) * f
+    return DAY_KEYS[-1][1]
+for fr in list(range(1, NFR + 1, 6)) + [NFR]:
+    env.apply_time(scene, VIDEO_SEASON, t_at((fr - 1) / FPS), frame=fr)
+print('DAY CYCLE', VIDEO_SEASON, 'balcony at %.1fs' % t_bal, DAY_KEYS)
+scene['video_season'] = VIDEO_SEASON
+
+# ----------------------------------------------------------------------------
+# render defaults (Cycles) + save
+# ----------------------------------------------------------------------------
+scene.render.engine = 'CYCLES'
+c = scene.cycles
+c.device = 'CPU'; c.samples = 8; c.use_adaptive_sampling = True; c.adaptive_threshold = 0.06
+c.use_denoising = True; c.denoiser = 'OPENIMAGEDENOISE'
+c.max_bounces = 3; c.diffuse_bounces = 2; c.glossy_bounces = 1; c.transmission_bounces = 2
+c.transparent_max_bounces = 8; c.sample_clamp_indirect = 3.0
+c.caustics_reflective = False; c.caustics_refractive = False
+scene.render.use_persistent_data = True
 scene.view_settings.view_transform = 'AgX'
-scene.view_settings.look = 'AgX - Medium High Contrast' if 'AgX - Medium High Contrast' in [
-    i.identifier for i in scene.view_settings.bl_rna.properties['look'].enum_items_static] else 'None'
-scene.view_settings.exposure = 0.0
+looks = [i.identifier for i in scene.view_settings.bl_rna.properties['look'].enum_items_static]
+scene.view_settings.look = next((l for l in looks if 'Medium High Contrast' in l), 'None')
+scene.frame_set(1)
 bpy.ops.wm.save_as_mainfile(filepath=OUT, compress=True)
 print('saved', OUT)

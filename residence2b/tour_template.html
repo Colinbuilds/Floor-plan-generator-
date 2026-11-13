@@ -1,0 +1,262 @@
+<title>Residence 2B Tour</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Marcellus&family=Manrope:wght@400;500;600&display=swap">
+<style>
+/*PANNELLUM_CSS*/
+</style>
+<style>
+/* Layout: full-height app - top bar, immersive 360 stage, side rail with floor plan + rooms (stacks under the stage on phones).
+   Single dark look on purpose: the staging is dark contemporary and the panoramas read best on a near-black ground. */
+:root {
+  --ink: #12100e;        /* page ground, warm graphite */
+  --panel: #1b1815;      /* rails and bars */
+  --line: #312b25;       /* hairlines */
+  --text: #ece5db;       /* primary text */
+  --muted: #9d9286;      /* secondary text */
+  --bronze: #b48a5c;     /* accent: satin bronze, as in the fixtures */
+  --bronze-hi: #d6ae7b;
+  --display: 'Marcellus', 'Cormorant', Georgia, serif;
+  --ui: 'Manrope', 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body { background: var(--ink); color: var(--text); font-family: var(--ui); font-size: 14px; }
+.app { height: 100%; display: grid; grid-template-rows: auto 1fr; }
+.bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  padding-block: 12px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  border-bottom: 1px solid var(--line); background: var(--panel); }
+.brand { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; min-width: 0; }
+.brand h1 { font-family: var(--display); font-weight: 400; font-size: 24px; margin: 0; letter-spacing: 0.02em; }
+.brand .facts { color: var(--muted); font-size: 12.5px; letter-spacing: 0.06em; text-transform: uppercase; }
+.tabs { display: flex; gap: 4px; background: var(--ink); border: 1px solid var(--line); border-radius: 999px; padding: 3px; }
+.tabs button, .seg button { font: 500 12.5px var(--ui); color: var(--muted); background: transparent; border: 0; border-radius: 999px;
+  padding: 7px 14px; cursor: pointer; letter-spacing: 0.02em; }
+.tabs button[aria-selected="true"], .seg button[aria-pressed="true"] { background: var(--bronze); color: #17120d; }
+.tabs button:focus-visible, .seg button:focus-visible, .room:focus-visible, .dot:focus-visible { outline: 2px solid var(--bronze-hi); outline-offset: 2px; }
+
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 0; }
+.stage { position: relative; min-height: 0; background: #000; }
+#pano { position: absolute; inset: 0; }
+.overlay { position: absolute; left: 16px; right: 16px; bottom: 16px; display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+  justify-content: space-between; pointer-events: none; }
+.overlay > * { pointer-events: auto; }
+.where { background: rgba(18, 16, 14, 0.72); backdrop-filter: blur(8px); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; max-width: 360px; }
+.where .room-name { font-family: var(--display); font-size: 22px; line-height: 1.15; }
+.where .sun { color: var(--muted); font-size: 12px; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.controls { display: grid; gap: 8px; justify-items: end; }
+.seg { display: flex; gap: 2px; flex-wrap: wrap; background: rgba(18, 16, 14, 0.72); backdrop-filter: blur(8px); border: 1px solid var(--line);
+  border-radius: 999px; padding: 3px; }
+.seg button { color: var(--text); }
+.hint { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); background: rgba(18, 16, 14, 0.6); color: var(--muted);
+  font-size: 12px; padding: 6px 12px; border-radius: 999px; pointer-events: none; white-space: nowrap; }
+
+.rail { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding-block: 16px;
+  padding-left: 16px; padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 16px; align-content: start; }
+.eyebrow { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+.plan { position: relative; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); aspect-ratio: 62 / 48; max-width: 100%; }
+.plan img { display: block; width: 100%; height: 100%; object-fit: cover; filter: saturate(0.9) brightness(0.92); }
+.dot { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; border: 2px solid var(--ink);
+  background: var(--bronze); cursor: pointer; padding: 0; box-shadow: 0 0 0 1px var(--bronze-hi); }
+.dot.here { background: var(--text); box-shadow: 0 0 0 3px var(--bronze); }
+.cone { position: absolute; width: 0; height: 0; pointer-events: none; transform-origin: 0 0; }
+.cone::before { content: ""; position: absolute; left: -26px; top: -46px; width: 52px; height: 46px;
+  background: radial-gradient(ellipse at 50% 100%, rgba(214, 174, 123, 0.55), rgba(214, 174, 123, 0) 70%);
+  clip-path: polygon(50% 100%, 0 0, 100% 0); }
+.rooms { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.room { text-align: left; font: 500 13px var(--ui); color: var(--text); background: var(--ink); border: 1px solid var(--line); border-radius: 8px;
+  padding: 9px 10px; cursor: pointer; min-width: 0; }
+.room small { display: block; color: var(--muted); font-weight: 400; font-size: 11px; margin-top: 2px; }
+.room[aria-current="true"] { border-color: var(--bronze); color: var(--bronze-hi); }
+.note { color: var(--muted); font-size: 12px; line-height: 1.55; max-width: 65ch; }
+
+.film { display: grid; place-items: center; padding-block: 24px; padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px)); overflow-y: auto; }
+.film figure { margin: 0; width: min(1100px, 100%); display: grid; gap: 12px; }
+.film video { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 10px; border: 1px solid var(--line); }
+.film figcaption { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.film figcaption b { color: var(--text); font-weight: 500; }
+.chapters { display: flex; flex-wrap: wrap; gap: 6px; }
+.chapters button { font: 500 12px var(--ui); color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer; font-variant-numeric: tabular-nums; }
+
+/* hotspot markers */
+.hs { width: 0; height: 0; }
+.hs .pin { position: absolute; transform: translate(-50%, -50%); display: flex; align-items: center; gap: 8px; cursor: pointer; white-space: nowrap; }
+.hs .ring { width: 30px; height: 30px; border-radius: 50%; border: 2px solid var(--text); background: rgba(180, 138, 92, 0.55);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5); transition: transform 0.2s; flex: none; }
+.hs .label { font: 600 12px var(--ui); color: var(--text); background: rgba(18, 16, 14, 0.78); padding: 5px 10px; border-radius: 999px; }
+.hs:hover .ring { transform: scale(1.15); }
+.pnlm-load-box { background: rgba(18, 16, 14, 0.85); }
+
+@media (max-width: 860px) {
+  .main { grid-template-columns: 1fr; grid-template-rows: minmax(340px, 62vh) auto; overflow-y: auto; }
+  .rail { border-left: 0; border-top: 1px solid var(--line); padding-left: max(16px, env(safe-area-inset-left, 0px)); }
+  .overlay { left: 10px; right: 10px; bottom: 10px; }
+  .controls { justify-items: start; }
+  .hint { display: none; }
+  .where .room-name { font-size: 19px; }
+}
+@media (prefers-reduced-motion: reduce) { .hs .ring { transition: none; } }
+</style>
+
+<div class="app">
+  <header class="bar">
+    <div class="brand">
+      <h1>Residence 2B</h1>
+      <span class="facts">2 Beds · 3 Baths · Den · 2,326 SF · Omaha</span>
+    </div>
+    <div class="tabs" role="tablist" aria-label="View">
+      <button role="tab" id="tab-tour" aria-selected="true">360° tour</button>
+      <button role="tab" id="tab-film" aria-selected="false">Walkthrough film</button>
+    </div>
+  </header>
+
+  <section class="main" id="view-tour">
+    <div class="stage">
+      <div id="pano"></div>
+      <div class="hint">Drag to look around · click a marker to walk there</div>
+      <div class="overlay">
+        <div class="where">
+          <div class="room-name" id="room-name">Entry</div>
+          <div class="sun" id="sun-line"></div>
+        </div>
+        <div class="controls">
+          <div class="seg" id="seg-season" role="group" aria-label="Season"></div>
+          <div class="seg" id="seg-time" role="group" aria-label="Time of day"></div>
+        </div>
+      </div>
+    </div>
+    <aside class="rail">
+      <div class="eyebrow">Floor plan · click a spot</div>
+      <div class="plan" id="plan"><img src="plan.jpg" alt="Overhead view of Residence 2B, furnished"><div class="cone" id="cone"></div></div>
+      <div class="eyebrow">Rooms</div>
+      <div class="rooms" id="rooms"></div>
+      <p class="note">Balcony faces south. Daylight follows the sun's real path over Omaha (41.3° N) on a representative date for each season. Interior rooms without windows switch between day and evening lighting.</p>
+    </aside>
+  </section>
+
+  <section class="film" id="view-film" hidden>
+    <figure>
+      <video id="video" src="walkthrough.mp4" controls playsinline preload="metadata"></video>
+      <div class="chapters" id="chapters"></div>
+      <figcaption id="film-caption"><b>45-second walkthrough, fall.</b> Starts at the front door in morning light, passes the den, moves through the kitchen and living room, reaches the balcony at golden hour, then visits the primary suite and Bedroom 2 into the evening.</figcaption>
+    </figure>
+  </section>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pannellum/2.5.6/pannellum.js"></script>
+<script>
+const D = /*TOUR_DATA*/;
+const SEASON_LABEL = { spring: 'Spring', summer: 'Summer', fall: 'Fall', winter: 'Winter' };
+const TIME_LABEL = { morning: 'Morning', midday: 'Midday', golden: 'Golden hour', night: 'Evening' };
+const state = { spot: 'entry', season: 'fall', time: 'golden' };
+
+function variantFor(spot) {
+  if (D.spots[spot].windows) return state.season + '_' + state.time;
+  return state.time === 'night' ? 'fall_night' : 'fall_midday';
+}
+const sceneId = (spot, v) => spot + '__' + (v || variantFor(spot));
+
+function makeHotspot(div, l) {
+  div.classList.add('hs');
+  const pin = document.createElement('div'); pin.className = 'pin';
+  pin.innerHTML = '<span class="ring"></span><span class="label"></span>';
+  pin.querySelector('.label').textContent = l.label;
+  div.appendChild(pin);
+}
+
+const scenes = {};
+for (const [spot, s] of Object.entries(D.spots)) {
+  for (const v of s.variants) {
+    scenes[sceneId(spot, v)] = {
+      type: 'equirectangular', panorama: 'panos/' + spot + '_' + v + '.jpg',
+      hotSpots: s.links.map(l => ({ pitch: l.pitch, yaw: l.yaw, type: 'custom', cssClass: 'hs-wrap',
+        createTooltipFunc: makeHotspot, createTooltipArgs: l, clickHandlerFunc: () => go(l.to) })),
+    };
+  }
+}
+const startLink = D.spots.entry.links[0];
+const viewer = pannellum.viewer('pano', {
+  default: { firstScene: sceneId('entry'), sceneFadeDuration: 700, autoLoad: true, hfov: 100, minHfov: 50, maxHfov: 120,
+             pitch: -4, yaw: startLink.yaw, showZoomCtrl: false, compass: false, keyboardZoom: true },
+  scenes,
+});
+
+function go(spot) {
+  if (spot === state.spot) return;
+  state.spot = spot;
+  viewer.loadScene(sceneId(spot), viewer.getPitch(), viewer.getYaw(), viewer.getHfov());   // keep the heading
+  render();
+}
+function relight() { viewer.loadScene(sceneId(state.spot), 'same', 'same', 'same'); render(); }
+
+// controls
+function seg(el, items, key, labels) {
+  el.innerHTML = '';
+  for (const it of items) {
+    const b = document.createElement('button');
+    b.id = key + '-' + it; b.textContent = labels[it];
+    b.setAttribute('aria-pressed', String(state[key] === it));
+    b.addEventListener('click', () => { state[key] = it; relight(); });
+    el.appendChild(b);
+  }
+}
+const plan = document.getElementById('plan');
+const dots = {};
+for (const [spot, s] of Object.entries(D.spots)) {
+  const d = document.createElement('button'); d.className = 'dot'; d.id = 'dot-' + spot;
+  d.style.left = s.map[0] + '%'; d.style.top = s.map[1] + '%';
+  d.title = s.label; d.setAttribute('aria-label', 'Go to ' + s.label);
+  d.addEventListener('click', () => go(spot));
+  plan.appendChild(d); dots[spot] = d;
+}
+const rooms = document.getElementById('rooms');
+const roomBtns = {};
+for (const [spot, s] of Object.entries(D.spots)) {
+  const b = document.createElement('button'); b.className = 'room'; b.id = 'room-' + spot;
+  b.innerHTML = '<span></span><small></small>';
+  b.querySelector('span').textContent = s.label;
+  b.querySelector('small').textContent = s.windows ? 'All seasons & times' : 'Day & evening';
+  b.addEventListener('click', () => go(spot));
+  rooms.appendChild(b); roomBtns[spot] = b;
+}
+function render() {
+  seg(document.getElementById('seg-season'), D.seasons, 'season', SEASON_LABEL);
+  seg(document.getElementById('seg-time'), D.times, 'time', TIME_LABEL);
+  const s = D.spots[state.spot];
+  document.getElementById('room-name').textContent = s.label;
+  const sun = D.sun[state.season + '_' + state.time];
+  document.getElementById('sun-line').textContent = s.windows
+    ? SEASON_LABEL[state.season] + ' (' + D.dates[state.season] + ') · ' + TIME_LABEL[state.time] + ' · ' + sun
+    : 'Interior room · ' + (state.time === 'night' ? 'evening' : 'daytime') + ' lighting';
+  for (const k in dots) { dots[k].classList.toggle('here', k === state.spot); roomBtns[k].setAttribute('aria-current', String(k === state.spot)); }
+  const cone = document.getElementById('cone');
+  cone.style.left = s.map[0] + '%'; cone.style.top = s.map[1] + '%';
+}
+render();
+(function spin() {           // floor-plan view cone follows the heading (yaw 0 = south, out the balcony = up on the plan)
+  try { document.getElementById('cone').style.transform = 'rotate(' + viewer.getYaw() + 'deg)'; } catch (e) {}
+  requestAnimationFrame(spin);
+})();
+
+// tabs + film chapters
+const tabs = { tour: document.getElementById('tab-tour'), film: document.getElementById('tab-film') };
+function show(which) {
+  document.getElementById('view-tour').hidden = which !== 'tour';
+  document.getElementById('view-film').hidden = which !== 'film';
+  tabs.tour.setAttribute('aria-selected', String(which === 'tour'));
+  tabs.film.setAttribute('aria-selected', String(which === 'film'));
+  if (which === 'tour') viewer.resize(); else viewer.stopAutoRotate && viewer.stopAutoRotate();
+}
+tabs.tour.addEventListener('click', () => show('tour'));
+tabs.film.addEventListener('click', () => show('film'));
+if (location.hash === '#film') show('film');
+const video = document.getElementById('video');
+for (const [t, label] of D.chapters) {
+  const b = document.createElement('button'); b.textContent = label + ' · ' + (t < 10 ? '0:0' : '0:') + Math.floor(t);
+  b.addEventListener('click', () => { video.currentTime = t; video.play().catch(() => {}); });
+  document.getElementById('chapters').appendChild(b);
+}
+if (D.film_note) document.getElementById('film-caption').insertAdjacentHTML('beforeend', ' <span></span>'),
+  document.querySelector('#film-caption span').textContent = D.film_note;
+</script>

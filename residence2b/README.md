@@ -1,11 +1,15 @@
-# Residence 2B – furnished Blender model & walkthrough
+# Residence 2B – staged Blender model, walkthrough & 360° tour
 
-Generated from `The-Residences_2B-Floor-Plan.pdf` (2 Beds | 3 Baths | Den, 2,326 SF, Levels 2–6).
+Generated from `The-Residences_2B-Floor-Plan.pdf` (2 Beds | 3 Baths | Den, 2,326 SF, Levels 2–6). It is staged in a dark contemporary style: smoked oak, charcoal millwork, black-veined marble and satin bronze. The setting is Omaha with a south-facing balcony, in all four seasons with a solar day cycle.
 
 | Script | What it does |
 |---|---|
 | `trace_plan.py` | Rasterises the PDF and traces the dark wall fill into 121 wall rectangles (`plan_walls.json`). |
-| `build_residence.py` | Builds the model in Blender (bpy 5.3): walls, door openings and leaves, windows, sliding doors, finishes, furniture, lighting, surroundings. Also builds the 45 s camera path and writes `camera_report.json` with clearance numbers. |
+| `geo.py` | Geometry and procedural material helpers. |
+| `environment.py` | Omaha surroundings: street, brick lofts, houses, tree canopy and skyline. Also defines the four seasons (foliage, snow, ground) and the time of day from real sun positions at 41.26° N. |
+| `build_residence.py` | Builds the model in Blender (bpy 5.3): walls, doors, windows, finishes, staging, lighting and surroundings. Also builds the 45 s camera path with its day cycle and writes `camera_report.json` with clearance numbers. Use `--season` to change the film's season (default `fall`). |
+| `tour_spots.py`, `render_panos.py` | The 10 tour spots, the links between them, and the 360° panorama renderer. |
+| `make_tour.py`, `tour_template.html` | Assembles the tour web page: a Pannellum viewer, hotspots, a clickable floor plan, season and time toggles, and the film tab. |
 | `plot_route.py` | Top-down diagnostic of the camera route, coloured by clearance to walls and furniture. |
 | `render_topdown.py` | Cut-away overhead render for checking the layout. |
 | `render_stills.py` | Renders single frames for look development. |
